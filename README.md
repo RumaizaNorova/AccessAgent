@@ -1,17 +1,27 @@
 # AccessPilot
 
-**Accessibility-first agent.** For people who cannot move freely — a talking desktop agent that opens sites, searches the web, and speaks back.
+**Voice agent for your desktop.** Small icon in the corner — click, speak, and it opens apps, searches the web, tells the time. For people who cannot move freely.
 
-## Desktop Agent (start here)
+## Voice Agent (native app — preferred)
+
+```bash
+cd agent-app
+npm install
+npm run tauri dev
+```
+
+Requires [Rust](https://rustup.rs). A small mic icon appears; click to talk.
+
+See [agent-app/README.md](agent-app/README.md).
+
+## Web fallback
 
 ```bash
 cd desktop
 node server.js
 ```
 
-Opens in your browser. Say or type: *"open wikipedia"*, *"search for scholarships"*, *"what time is it"*. The agent speaks back. Bookmark the URL for quick access.
-
-See [desktop/README.md](desktop/README.md).
+Opens in browser. Bookmark the URL.
 
 ## Chrome Extension (in-page control)
 
