@@ -1,36 +1,30 @@
 # AccessPilot
 
-**Accessibility-first web agent.** Control websites with simple commands—reduce clicking, scanning, and navigation.
+**Accessibility-first agent.** For people who cannot move freely — a talking desktop agent that opens sites, searches the web, and speaks back.
 
-## Quick Start
+## Desktop Agent (start here)
 
 ```bash
-npm install
-npm run build
+cd desktop
+node server.js
 ```
 
-Then load `extension/dist` in Chrome:
+Opens in your browser. Say or type: *"open wikipedia"*, *"search for scholarships"*, *"what time is it"*. The agent speaks back. Bookmark the URL for quick access.
 
-1. Open `chrome://extensions`
-2. Enable **Developer mode**
-3. **Load unpacked** → select `extension/dist`
+See [desktop/README.md](desktop/README.md).
 
-**Hotkey:** `Ctrl+Shift+Space` (Mac: `Cmd+Shift+Space`)
+## Chrome Extension (in-page control)
 
-## Commands
+For find/click/type on the current webpage:
 
-| Command | Example |
-|--------|---------|
-| open | `open ualberta.ca` |
-| search | `search for scholarships` |
-| find | `find requirements` |
-| click | `click continue` |
-| access mode | `one-hand mode on` |
+```bash
+npm install && npm run build
+```
+
+Load `extension/dist` in Chrome → [chrome://extensions](chrome://extensions).
 
 ## Docs
 
-- [Install & Demo](docs/README.md)
+- [Desktop Plan](docs/DESKTOP_AGENT_PLAN.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Privacy](docs/PRIVACY.md)
-- [Demo Script](docs/DEMO_SCRIPT.md)
-- [Roadmap](docs/ROADMAP.md)

@@ -1,0 +1,27 @@
+{
+  "name": "accesspilot-desktop",
+  "version": "0.1.0",
+  "description": "Desktop talking agent - accessibility-first",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "start:server": "node server.js",
+    "build": "electron-builder",
+    "build:mac": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^22.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "build": {
+    "appId": "com.accesspilot.desktop",
+    "productName": "AccessPilot",
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": ["dmg", "zip"]
+    }
+  }
+}
