@@ -1,0 +1,19 @@
+{
+  "name": "accesspilot",
+  "version": "0.1.0",
+  "description": "Accessibility-first web agent - control websites with simple commands",
+  "type": "module",
+  "scripts": {
+    "dev": "vite build --mode development --watch",
+    "build": "npm run icons && vite build",
+    "icons": "node scripts/generate-icons.cjs",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "pngjs": "^7.0.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.4.0",
+    "vite-plugin-web-extension": "^4.1.4"
+  }
+}
