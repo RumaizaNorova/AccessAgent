@@ -120,6 +120,7 @@ async fn open_app(name: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_stt::init())
         .invoke_handler(tauri::generate_handler![parse_intent, open_url, open_app])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

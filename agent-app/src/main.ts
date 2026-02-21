@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
+import {
+  startListening as sttStart,
+  stopListening as sttStop,
+  onResult,
+  onStateChange,
+  onError,
+  requestPermission,
+  isAvailable,
+} from "tauri-plugin-stt-api";
 
-const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 const icon = document.getElementById("icon")!;
 
 function speak(text: string) {
@@ -65,7 +73,6 @@ async function runCommand(text: string) {
   }
   if (parsed.type === "open") {
     const p = parsed.payload;
-    // App names: no dot, or known apps
     const knownApps = ["chrome", "safari", "firefox", "spotify", "slack", "mail", "notes"];
     if (!p.includes(".") && (knownApps.includes(p.toLowerCase()) || /^[A-Z]/.test(p))) {
       try {
@@ -93,78 +100,99 @@ async function runCommand(text: string) {
   speak("I didn't understand. Try: open wikipedia, or search for something.");
 }
 
-let recognizer: any = null;
 let isListening = false;
 let fullText = "";
 let lastProcessed = "";
+let unlistenResult: (() => void) | null = null;
+let unlistenState: (() => void) | null = null;
+let unlistenError: (() => void) | null = null;
 
-function startListening() {
-  if (!SpeechRecognition) {
-    speak("Voice not supported.");
-    return;
-  }
+function cleanupListeners() {
+  unlistenResult?.();
+  unlistenState?.();
+  unlistenError?.();
+  unlistenResult = null;
+  unlistenState = null;
+  unlistenError = null;
+}
 
+async function startListening() {
   try {
-    recognizer = new SpeechRecognition();
-    recognizer.continuous = true;
-    recognizer.interimResults = true;
-    recognizer.lang = navigator.language || "en-US";
+    const available = await isAvailable();
+    if (!available.available) {
+      speak(available.reason || "Voice not supported. Install Vosk: see README.");
+      return;
+    }
+
+    const perm = await requestPermission();
+    if (perm.microphone !== "granted") {
+      speak("Allow microphone in System Settings.");
+      return;
+    }
+
     fullText = "";
+    isListening = true;
+    icon.classList.add("listening");
 
-    recognizer.onresult = (e: any) => {
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i];
-        const t = (r[0]?.transcript || "").trim();
-        if (r.isFinal && t) fullText = (fullText ? fullText + " " : "") + t;
+    unlistenResult = await onResult((result) => {
+      if (result.isFinal && result.transcript?.trim()) {
+        fullText = (fullText ? fullText + " " : "") + result.transcript.trim();
       }
-    };
+    });
 
-    recognizer.onend = () => {
-      isListening = false;
-      icon.classList.remove("listening");
-      const txt = fullText.trim();
-      if (txt && txt !== lastProcessed) {
-        lastProcessed = txt;
-        runCommand(txt);
-        setTimeout(() => { lastProcessed = ""; }, 2000);
-      }
-    };
-
-    recognizer.onerror = (e: any) => {
-      const err = e.error || "unknown";
-      isListening = false;
-      icon.classList.remove("listening");
-      if (err === "aborted") return;
-      if (err === "not-allowed") speak("Allow microphone in System Settings.");
-      else if (err === "no-speech") speak("Speak, then click again to stop.");
-      else if (err === "network") speak("Speech service unreachable. Try rebuilding: npm run tauri build");
-      else if (err === "audio-capture") speak("No microphone found.");
-      else if (err === "service-not-allowed") speak("Enable Siri or Dictation.");
-      else speak(`Voice error: ${err}`);
-    };
-
-    navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
-      stream.getTracks().forEach((t) => t.stop());
-      setTimeout(() => {
-        try {
-          recognizer.start();
-          isListening = true;
-          icon.classList.add("listening");
-        } catch (err) {
-          speak("Couldn't start.");
+    unlistenState = await onStateChange((event) => {
+      if (event.state === "idle" && isListening) {
+        isListening = false;
+        icon.classList.remove("listening");
+        cleanupListeners();
+        const txt = fullText.trim();
+        if (txt && txt !== lastProcessed) {
+          lastProcessed = txt;
+          runCommand(txt);
+          setTimeout(() => { lastProcessed = ""; }, 2000);
         }
-      }, 200);
-    }).catch(() => {
-      speak("Allow microphone access.");
+      }
+    });
+
+    unlistenError = await onError((err) => {
+      isListening = false;
+      icon.classList.remove("listening");
+      cleanupListeners();
+      if (err.code === "PERMISSION_DENIED" || err.code === "SPEECH_PERMISSION_DENIED") {
+        speak("Allow microphone in System Settings.");
+      } else if (err.code === "NO_SPEECH") {
+        speak("Speak, then click again to stop.");
+      } else if (err.code === "CANCELLED") {
+        // User stopped, ignore
+      } else {
+        speak(err.message || "Voice error.");
+      }
+    });
+
+    await sttStart({
+      language: navigator.language?.startsWith("en") ? "en-US" : "en-US",
+      interimResults: true,
+      continuous: true,
     });
   } catch (e) {
-    speak("Voice error.");
+    isListening = false;
+    icon.classList.remove("listening");
+    cleanupListeners();
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("library") && msg.includes("vosk")) {
+      speak("Install Vosk first. Run: curl -LO https://github.com/alphacep/vosk-api/releases/download/v0.3.42/vosk-osx-0.3.42.zip && unzip vosk-osx-0.3.42.zip && sudo cp vosk-osx-0.3.42/libvosk.dylib /usr/local/lib/");
+    } else {
+      speak("Voice error: " + msg);
+    }
   }
 }
 
-function stopListening() {
-  if (recognizer && isListening) {
-    recognizer.stop();
+async function stopListening() {
+  if (!isListening) return;
+  try {
+    await sttStop();
+  } catch {
+    // Ignore
   }
 }
 
@@ -172,19 +200,18 @@ const typePanel = document.getElementById("type-panel")!;
 const typeInput = document.getElementById("type-input") as HTMLInputElement;
 const typeGo = document.getElementById("type-go")!;
 
-// Click: start/stop voice. Double-click: show type panel.
-icon.addEventListener("click", (e) => {
+icon.addEventListener("click", async (e) => {
   e.preventDefault();
   if (isListening) {
-    stopListening();
+    await stopListening();
   } else {
-    startListening();
+    await startListening();
   }
 });
 
-icon.addEventListener("dblclick", (e) => {
+icon.addEventListener("dblclick", async (e) => {
   e.preventDefault();
-  stopListening();
+  await stopListening();
   const show = typePanel.style.display === "none";
   typePanel.style.display = show ? "flex" : "none";
   if (show) typeInput.focus();
@@ -202,4 +229,3 @@ typeGo.addEventListener("click", () => {
 typeInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") typeGo.click();
 });
-

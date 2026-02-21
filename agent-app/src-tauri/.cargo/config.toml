@@ -1,0 +1,6 @@
+# Tell the linker where to find libvosk.dylib
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-L/usr/local/lib"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-L/usr/local/lib"]

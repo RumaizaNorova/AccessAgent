@@ -6,7 +6,14 @@ A **typing-first desktop agent** — small icon in the corner. Type commands: op
 
 1. **Rust** — [Install Rust](https://www.rust-lang.org/learn/get-started)
 2. **macOS** — Built for macOS
-3. **OpenAI API key** (optional) — For AI intent parsing. Set `OPENAI_API_KEY` in your environment. Without it, a simple rule-based parser is used.
+3. **Vosk library** (required for voice) — Install the native speech recognition library:
+   ```bash
+   curl -LO https://github.com/alphacep/vosk-api/releases/download/v0.3.42/vosk-osx-0.3.42.zip
+   unzip vosk-osx-0.3.42.zip
+   sudo cp vosk-osx-0.3.42/libvosk.dylib /usr/local/lib/
+   ```
+   On first use, the English model (~40 MB) downloads automatically.
+4. **OpenAI API key** (optional) — For AI intent parsing. Set `OPENAI_API_KEY` in your environment. Without it, a simple rule-based parser is used.
 
 ## Run
 
@@ -19,8 +26,9 @@ npm run tauri dev
 ## Use
 
 1. A small blue icon + input field appears
-2. **Type** a command and press Enter or click Go
-3. Examples: `open wikipedia`, `search scholarships`, `open Chrome`, `what time is it`
+2. **Click** the icon to start voice — speak, then click again to stop and run your command
+3. **Double-click** the icon to show the type panel for typed commands
+4. Examples: `open wikipedia`, `search scholarships`, `open Chrome`, `what time is it`
 
 ## Commands
 
