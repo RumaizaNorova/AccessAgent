@@ -1,3 +1,5 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use reqwest::multipart;
 use std::process::Command;
 
 #[derive(Debug, serde::Deserialize)]
@@ -89,6 +91,79 @@ Rules:
     Ok(intent)
 }
 
+/// Check if Whisper transcription is available (API key set)
+#[tauri::command]
+async fn whisper_available() -> bool {
+    std::env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false)
+}
+
+/// Transcribe audio using OpenAI Whisper API. Accepts base64-encoded audio.
+/// Supported formats: webm, mp3, mp4, mpeg, mpga, m4a, wav
+#[tauri::command]
+async fn transcribe_audio(base64_audio: String, mime_type: Option<String>) -> Result<String, String> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "No API key. Set OPENAI_API_KEY env var.")?
+        .trim()
+        .to_string();
+    if api_key.is_empty() {
+        return Err("No API key. Set OPENAI_API_KEY env var.".into());
+    }
+
+    let audio_bytes = BASE64
+        .decode(&base64_audio)
+        .map_err(|e| format!("Invalid base64 audio: {}", e))?;
+
+    let (file_name, mime) = match mime_type.as_deref() {
+        Some("audio/webm") | None => ("audio.webm", "audio/webm"),
+        Some("audio/mpeg") => ("audio.mp3", "audio/mpeg"),
+        Some("audio/mp4") => ("audio.m4a", "audio/mp4"),
+        Some("audio/wav") => ("audio.wav", "audio/wav"),
+        Some(m) => ("audio.webm", m),
+    };
+
+    let form = multipart::Form::new()
+        .part(
+            "file",
+            multipart::Part::bytes(audio_bytes)
+                .file_name(file_name)
+                .mime_str(mime)
+                .map_err(|e| format!("Invalid MIME: {}", e))?,
+        )
+        .text("model", "whisper-1")
+        .text("response_format", "json");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let res = client
+        .post("https://api.openai.com/v1/audio/transcriptions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("Whisper API error ({}): {}", status, text));
+    }
+
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    let transcript = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+        parsed
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        text.trim().to_string()
+    };
+    Ok(transcript)
+}
+
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -118,10 +193,22 @@ async fn open_app(name: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Load .env from agent-app/ (parent of src-tauri)
+    if let Some(manifest_dir) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        let env_path = manifest_dir.join(".env");
+        let _ = dotenvy::from_path(env_path);
+    }
+    let _ = dotenvy::dotenv();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_stt::init())
-        .invoke_handler(tauri::generate_handler![parse_intent, open_url, open_app])
+        .invoke_handler(tauri::generate_handler![
+            parse_intent,
+            whisper_available,
+            transcribe_audio,
+            open_url,
+            open_app
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

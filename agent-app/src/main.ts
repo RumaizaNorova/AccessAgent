@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   startListening as sttStart,
   stopListening as sttStop,
@@ -114,6 +115,12 @@ let downloadProgressSpoken = false;
 
 let unlistenBackup: (() => void) | null = null;
 
+// Whisper path: MediaRecorder for accurate transcription when API key is set
+let mediaRecorder: MediaRecorder | null = null;
+let audioChunks: Blob[] = [];
+let useWhisperMode = false;
+let whisperMimeType = "audio/webm";
+
 function cleanupListeners() {
   unlistenResult?.();
   unlistenState?.();
@@ -138,6 +145,51 @@ function runCapturedCommand() {
   }
 }
 
+async function startListeningWhisper() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  // Safari/WebKit (Tauri on macOS) supports audio/mp4, not webm
+  const mimeType = MediaRecorder.isTypeSupported("audio/mp4")
+    ? "audio/mp4"
+    : MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : "audio/webm";
+  const recorder = new MediaRecorder(stream, { mimeType });
+  whisperMimeType = recorder.mimeType.startsWith("audio/mp4") ? "audio/mp4" : "audio/webm";
+  audioChunks = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) audioChunks.push(e.data);
+  };
+  recorder.start(100);
+  mediaRecorder = recorder;
+  useWhisperMode = true;
+}
+
+function stopListeningWhisper(): Promise<string> {
+  return new Promise((resolve) => {
+    const recorder = mediaRecorder;
+    mediaRecorder = null;
+    if (!recorder || recorder.state === "inactive") {
+      resolve("");
+      return;
+    }
+    recorder.onstop = () => {
+      recorder.stream.getTracks().forEach((t) => t.stop());
+      if (audioChunks.length === 0) {
+        resolve("");
+        return;
+      }
+      const blob = new Blob(audioChunks, { type: whisperMimeType });
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64 = (reader.result as string).split(",")[1] ?? "";
+        resolve(base64);
+      };
+      reader.readAsDataURL(blob);
+    };
+    recorder.stop();
+  });
+}
+
 async function startListening() {
   if (isStarting) {
     speak("Please wait.");
@@ -150,17 +202,26 @@ async function startListening() {
   try {
     isStarting = true;
     speak("Starting.");
-    const available = await isAvailable();
-    if (!available.available) {
-      isStarting = false;
-      speak(available.reason || "Voice not ready.");
-      return;
-    }
-
     const perm = await requestPermission();
     if (perm.microphone !== "granted") {
       isStarting = false;
       speak("Allow microphone in System Settings.");
+      return;
+    }
+
+    const whisperAvail = await invoke<boolean>("whisper_available");
+    if (whisperAvail) {
+      await startListeningWhisper();
+      isListening = true;
+      icon.classList.add("listening");
+      isStarting = false;
+      return;
+    }
+
+    const available = await isAvailable();
+    if (!available.available) {
+      isStarting = false;
+      speak(available.reason || "Voice not ready.");
       return;
     }
 
@@ -171,7 +232,7 @@ async function startListening() {
     icon.classList.add("listening");
 
     // Listen for model download (first run)
-    unlistenDownload = await listen<{ status: string; progress: number }>("plugin:stt:download-progress", (event) => {
+    unlistenDownload = await listen<{ status: string; progress: number }>("stt://download-progress", (event) => {
       if (!downloadProgressSpoken) {
         speak("Downloading voice model, one moment.");
         downloadProgressSpoken = true;
@@ -248,6 +309,14 @@ async function startListening() {
   }
 }
 
+// Focus window on load so first click hits the icon (not consumed by OS for activation)
+getCurrentWindow()
+  .setFocus()
+  .catch(() => {});
+
+// Warm-up: check availability on load
+isAvailable().catch(() => {});
+
 icon.addEventListener("pointerdown", async (e) => {
   e.preventDefault();
   e.stopPropagation();
@@ -255,14 +324,41 @@ icon.addEventListener("pointerdown", async (e) => {
   if (isListening) {
     isListening = false;
     icon.classList.remove("listening");
-    cleanupListeners();
-    try {
-      await sttStop();
-    } catch {
-      // Ignore
+    if (useWhisperMode) {
+      useWhisperMode = false;
+      speak("Transcribing.");
+      try {
+        const base64 = await stopListeningWhisper();
+        if (base64) {
+          const txt = await invoke<string>("transcribe_audio", {
+            base64_audio: base64,
+            mime_type: whisperMimeType,
+          });
+          if (txt && txt !== lastProcessed) {
+            lastProcessed = txt;
+            runCommand(txt);
+            setTimeout(() => { lastProcessed = ""; }, 2000);
+          } else if (!txt) {
+            speak("No speech detected. Speak clearly, then click to stop.");
+          }
+        } else {
+          speak("No speech detected. Speak clearly, then click to stop.");
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("Transcription error:", msg);
+        const short = msg.length > 60 ? msg.slice(0, 60) + "…" : msg;
+        speak(short.includes("API key") ? "Check your API key in .env" : short || "Transcription failed.");
+      }
+    } else {
+      cleanupListeners();
+      try {
+        await sttStop();
+      } catch {
+        // Ignore
+      }
+      setTimeout(runCapturedCommand, 800);
     }
-    // Wait for plugin to flush final results
-    setTimeout(runCapturedCommand, 800);
   } else {
     await startListening();
   }
