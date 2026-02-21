@@ -11,7 +11,8 @@ function speak(text: string) {
   }
 }
 
-function parseCommand(raw: string): { type: string; payload: string } {
+/** Fallback when OpenAI is unavailable */
+function parseCommandFallback(raw: string): { type: string; payload: string } {
   const t = raw.trim().toLowerCase().replace(/\s+/g, " ");
   if (!t) return { type: "unknown", payload: "" };
 
@@ -24,6 +25,18 @@ function parseCommand(raw: string): { type: string; payload: string } {
   return { type: "search", payload: t };
 }
 
+async function parseCommand(text: string): Promise<{ type: string; payload: string }> {
+  try {
+    const intent = await invoke<{ action: string; payload: string }>("parse_intent", {
+      command: text,
+      apiKeyOverride: null,
+    });
+    return { type: intent.action, payload: intent.payload || "" };
+  } catch {
+    return parseCommandFallback(text);
+  }
+}
+
 function resolveUrl(payload: string): string {
   const p = payload.trim();
   if (/^https?:\/\//i.test(p)) return p;
@@ -32,7 +45,7 @@ function resolveUrl(payload: string): string {
 }
 
 async function runCommand(text: string) {
-  const parsed = parseCommand(text);
+  const parsed = await parseCommand(text);
 
   if (parsed.type === "time") {
     const now = new Date();

@@ -1,11 +1,12 @@
 # AccessPilot Agent
 
-A **typing-first desktop agent** — small icon in the corner. Type commands: open apps, search the web, get the time. Works offline, no voice needed.
+A **typing-first desktop agent** — small icon in the corner. Type commands: open apps, search the web, get the time. Uses OpenAI for natural-language understanding (fallback to rules when offline).
 
 ## Prerequisites
 
 1. **Rust** — [Install Rust](https://www.rust-lang.org/learn/get-started)
 2. **macOS** — Built for macOS
+3. **OpenAI API key** (optional) — For AI intent parsing. Set `OPENAI_API_KEY` in your environment. Without it, a simple rule-based parser is used.
 
 ## Run
 
