@@ -5,9 +5,16 @@
 }
 
 body {
-  background: transparent;
+  background: #0f172a;
   overflow: hidden;
   font-family: system-ui, sans-serif;
+}
+
+.agent-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px;
 }
 
 .agent-icon {
@@ -41,4 +48,38 @@ body {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.85; }
+}
+
+.type-panel {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  background: #1e293b;
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+.type-panel input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  background: #0f172a;
+  color: #f8fafc;
+  font-size: 14px;
+  outline: none;
+}
+
+.type-panel input:focus {
+  border-color: #2563eb;
+}
+
+.type-panel button {
+  padding: 8px 16px;
+  background: #2563eb;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
 }

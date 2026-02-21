@@ -28,7 +28,7 @@ function resolveUrl(payload: string): string {
   const p = payload.trim();
   if (/^https?:\/\//i.test(p)) return p;
   if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(p)) return `https://${p}`;
-  return `https://www.google.com/search?q=${encodeURIComponent(p)}`;
+  return `https://duckduckgo.com/?q=${encodeURIComponent(p)}`;
 }
 
 async function runCommand(text: string) {
@@ -71,7 +71,7 @@ async function runCommand(text: string) {
     return;
   }
   if (parsed.type === "search") {
-    const url = `https://www.google.com/search?q=${encodeURIComponent(parsed.payload)}`;
+    const url = `https://duckduckgo.com/?q=${encodeURIComponent(parsed.payload)}`;
     await invoke("open_url", { url });
     speak(`Searching for ${parsed.payload}`);
     return;
@@ -82,48 +82,70 @@ async function runCommand(text: string) {
 
 let recognizer: any = null;
 let isListening = false;
+let fullText = "";
+let lastProcessed = "";
 
 function startListening() {
   if (!SpeechRecognition) {
-    speak("Voice not supported. Please use Chrome.");
+    speak("Voice not supported.");
     return;
   }
 
   try {
     recognizer = new SpeechRecognition();
-    recognizer.continuous = false;
+    recognizer.continuous = true;
     recognizer.interimResults = true;
     recognizer.lang = navigator.language || "en-US";
+    fullText = "";
 
     recognizer.onresult = (e: any) => {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
         const t = (r[0]?.transcript || "").trim();
-        if (r.isFinal && t) runCommand(t);
+        if (r.isFinal && t) fullText = (fullText ? fullText + " " : "") + t;
       }
     };
 
     recognizer.onend = () => {
       isListening = false;
       icon.classList.remove("listening");
+      const txt = fullText.trim();
+      if (txt && txt !== lastProcessed) {
+        lastProcessed = txt;
+        runCommand(txt);
+        setTimeout(() => { lastProcessed = ""; }, 2000);
+      }
     };
 
     recognizer.onerror = (e: any) => {
+      const err = e.error || "unknown";
       isListening = false;
       icon.classList.remove("listening");
-      if (e.error !== "aborted") speak("Couldn't hear you. Try again.");
+      if (err === "aborted") return;
+      if (err === "not-allowed") speak("Allow microphone in System Settings.");
+      else if (err === "no-speech") speak("Speak, then click again to stop.");
+      else if (err === "network") speak("Speech service unreachable. Try rebuilding: npm run tauri build");
+      else if (err === "audio-capture") speak("No microphone found.");
+      else if (err === "service-not-allowed") speak("Enable Siri or Dictation.");
+      else speak(`Voice error: ${err}`);
     };
 
     navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
       stream.getTracks().forEach((t) => t.stop());
-      recognizer.start();
-      isListening = true;
-      icon.classList.add("listening");
+      setTimeout(() => {
+        try {
+          recognizer.start();
+          isListening = true;
+          icon.classList.add("listening");
+        } catch (err) {
+          speak("Couldn't start.");
+        }
+      }, 200);
     }).catch(() => {
-      speak("Allow microphone to use voice.");
+      speak("Allow microphone access.");
     });
   } catch (e) {
-    speak("Voice error. Try again.");
+    speak("Voice error.");
   }
 }
 
@@ -133,6 +155,11 @@ function stopListening() {
   }
 }
 
+const typePanel = document.getElementById("type-panel")!;
+const typeInput = document.getElementById("type-input") as HTMLInputElement;
+const typeGo = document.getElementById("type-go")!;
+
+// Click: start/stop voice. Double-click: show type panel.
 icon.addEventListener("click", (e) => {
   e.preventDefault();
   if (isListening) {
@@ -140,5 +167,26 @@ icon.addEventListener("click", (e) => {
   } else {
     startListening();
   }
+});
+
+icon.addEventListener("dblclick", (e) => {
+  e.preventDefault();
+  stopListening();
+  const show = typePanel.style.display === "none";
+  typePanel.style.display = show ? "flex" : "none";
+  if (show) typeInput.focus();
+});
+
+typeGo.addEventListener("click", () => {
+  const cmd = typeInput.value.trim();
+  if (cmd) {
+    runCommand(cmd);
+    typeInput.value = "";
+    typePanel.style.display = "none";
+  }
+});
+
+typeInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") typeGo.click();
 });
 

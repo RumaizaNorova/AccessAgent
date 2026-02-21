@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    __name_lib::run()
+    accesspilot_agent_lib::run()
 }
