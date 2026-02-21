@@ -15,15 +15,10 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || "127.0.0.1",
-    hmr: host
-      ? {
-          protocol: "ws",
-          host,
-          port: 1421,
-        }
-      : undefined,
+    // HMR off = no auto-reload on file save. Prevents interrupting the 2.3GB model download.
+    // Set to true for hot reload during development after the model is cached.
+    hmr: false,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
   },

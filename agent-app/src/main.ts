@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   startListening as sttStart,
   stopListening as sttStop,
@@ -101,43 +102,99 @@ async function runCommand(text: string) {
 }
 
 let isListening = false;
+let isStarting = false;
 let fullText = "";
+let lastInterim = "";
 let lastProcessed = "";
 let unlistenResult: (() => void) | null = null;
 let unlistenState: (() => void) | null = null;
 let unlistenError: (() => void) | null = null;
+let unlistenDownload: (() => void) | null = null;
+let downloadProgressSpoken = false;
+
+let unlistenBackup: (() => void) | null = null;
 
 function cleanupListeners() {
   unlistenResult?.();
   unlistenState?.();
   unlistenError?.();
+  unlistenDownload?.();
+  unlistenBackup?.();
   unlistenResult = null;
   unlistenState = null;
   unlistenError = null;
+  unlistenDownload = null;
+  unlistenBackup = null;
+}
+
+function runCapturedCommand() {
+  const txt = (fullText || lastInterim).trim();
+  if (txt && txt !== lastProcessed) {
+    lastProcessed = txt;
+    runCommand(txt);
+    setTimeout(() => { lastProcessed = ""; }, 2000);
+  } else if (!txt) {
+    speak("No speech detected. Speak clearly, pause, then click to stop.");
+  }
 }
 
 async function startListening() {
+  if (isStarting) {
+    speak("Please wait.");
+    return;
+  }
+  if (isListening) {
+    speak("Already recording. Click again to stop.");
+    return;
+  }
   try {
+    isStarting = true;
+    speak("Starting.");
     const available = await isAvailable();
     if (!available.available) {
-      speak(available.reason || "Voice not supported. Install Vosk: see README.");
+      isStarting = false;
+      speak(available.reason || "Voice not ready.");
       return;
     }
 
     const perm = await requestPermission();
     if (perm.microphone !== "granted") {
+      isStarting = false;
       speak("Allow microphone in System Settings.");
       return;
     }
 
     fullText = "";
+    lastInterim = "";
+    downloadProgressSpoken = false;
     isListening = true;
     icon.classList.add("listening");
 
-    unlistenResult = await onResult((result) => {
-      if (result.isFinal && result.transcript?.trim()) {
-        fullText = (fullText ? fullText + " " : "") + result.transcript.trim();
+    // Listen for model download (first run)
+    unlistenDownload = await listen<{ status: string; progress: number }>("plugin:stt:download-progress", (event) => {
+      if (!downloadProgressSpoken) {
+        speak("Downloading voice model, one moment.");
+        downloadProgressSpoken = true;
       }
+    });
+
+    unlistenResult = await onResult((result) => {
+      const t = result.transcript?.trim() || "";
+      if (!t) return;
+      if (result.isFinal) {
+        fullText = (fullText ? fullText + " " : "") + t;
+        lastInterim = "";
+      } else {
+        lastInterim = t;
+      }
+    });
+    unlistenBackup = await listen("stt://result", (e: { payload: unknown }) => {
+      const r = e.payload as { transcript?: string; isFinal?: boolean; is_final?: boolean };
+      const t = r?.transcript?.trim() || "";
+      if (!t) return;
+      const fin = r.isFinal ?? r.is_final ?? false;
+      if (fin) { fullText = (fullText ? fullText + " " : "") + t; lastInterim = ""; }
+      else { lastInterim = t; }
     });
 
     unlistenState = await onStateChange((event) => {
@@ -145,12 +202,7 @@ async function startListening() {
         isListening = false;
         icon.classList.remove("listening");
         cleanupListeners();
-        const txt = fullText.trim();
-        if (txt && txt !== lastProcessed) {
-          lastProcessed = txt;
-          runCommand(txt);
-          setTimeout(() => { lastProcessed = ""; }, 2000);
-        }
+        setTimeout(runCapturedCommand, 800);
       }
     });
 
@@ -159,18 +211,18 @@ async function startListening() {
       icon.classList.remove("listening");
       cleanupListeners();
       if (err.code === "PERMISSION_DENIED" || err.code === "SPEECH_PERMISSION_DENIED") {
-        speak("Allow microphone in System Settings.");
-      } else if (err.code === "NO_SPEECH") {
-        speak("Speak, then click again to stop.");
+        speak("Allow microphone.");
       } else if (err.code === "CANCELLED") {
-        // User stopped, ignore
+        // User stopped
+      } else if (err.code === "ALREADY_LISTENING") {
+        speak("Try again.");
       } else {
         speak(err.message || "Voice error.");
       }
     });
 
     await sttStart({
-      language: navigator.language?.startsWith("en") ? "en-US" : "en-US",
+      language: "en-US",
       interimResults: true,
       continuous: true,
     });
@@ -179,53 +231,39 @@ async function startListening() {
     icon.classList.remove("listening");
     cleanupListeners();
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("library") && msg.includes("vosk")) {
-      speak("Install Vosk first. Run: curl -LO https://github.com/alphacep/vosk-api/releases/download/v0.3.42/vosk-osx-0.3.42.zip && unzip vosk-osx-0.3.42.zip && sudo cp vosk-osx-0.3.42/libvosk.dylib /usr/local/lib/");
+    if (msg.includes("Already listening") || msg.includes("ALREADY")) {
+      try {
+        await sttStop();
+      } catch {
+        // Ignore
+      }
+      speak("Try again.");
+    } else if (msg.includes("library") && msg.includes("vosk")) {
+      speak("Install Vosk: see README.");
     } else {
       speak("Voice error: " + msg);
     }
+  } finally {
+    isStarting = false;
   }
 }
 
-async function stopListening() {
-  if (!isListening) return;
-  try {
-    await sttStop();
-  } catch {
-    // Ignore
-  }
-}
-
-const typePanel = document.getElementById("type-panel")!;
-const typeInput = document.getElementById("type-input") as HTMLInputElement;
-const typeGo = document.getElementById("type-go")!;
-
-icon.addEventListener("click", async (e) => {
+icon.addEventListener("pointerdown", async (e) => {
   e.preventDefault();
+  e.stopPropagation();
+  if (isStarting) return;
   if (isListening) {
-    await stopListening();
+    isListening = false;
+    icon.classList.remove("listening");
+    cleanupListeners();
+    try {
+      await sttStop();
+    } catch {
+      // Ignore
+    }
+    // Wait for plugin to flush final results
+    setTimeout(runCapturedCommand, 800);
   } else {
     await startListening();
   }
-});
-
-icon.addEventListener("dblclick", async (e) => {
-  e.preventDefault();
-  await stopListening();
-  const show = typePanel.style.display === "none";
-  typePanel.style.display = show ? "flex" : "none";
-  if (show) typeInput.focus();
-});
-
-typeGo.addEventListener("click", () => {
-  const cmd = typeInput.value.trim();
-  if (cmd) {
-    runCommand(cmd);
-    typeInput.value = "";
-    typePanel.style.display = "none";
-  }
-});
-
-typeInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") typeGo.click();
 });

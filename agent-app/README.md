@@ -15,6 +15,8 @@ A **typing-first desktop agent** — small icon in the corner. Type commands: op
    On first use, the English model (~40 MB) downloads automatically.
 4. **OpenAI API key** (optional) — For AI intent parsing. Set `OPENAI_API_KEY` in your environment. Without it, a simple rule-based parser is used.
 
+**First run:** The voice model (~2.3 GB) downloads automatically. HMR is disabled so file saves won't interrupt it. Avoid editing files until the download finishes.
+
 ## Run
 
 ```bash
