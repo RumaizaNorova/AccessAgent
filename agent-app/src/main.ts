@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { writeFile, BaseDirectory } from "@tauri-apps/plugin-fs";
 import { requestPermission } from "tauri-plugin-stt-api";
 import AudioRecorder from "audio-recorder-polyfill";
 
@@ -121,12 +120,19 @@ async function startListeningWhisper() {
   mediaRecorder = recorder as MediaRecorder;
 }
 
-const AUDIO_TEMP_FILE = "accesspilot_audio_temp";
+type StopResult = { base64: string; mimeType: string } | { error: string };
 
-type StopResult = { filename: string; mimeType: string } | { error: string };
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunk = 8192;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
 
 function stopListeningWhisper(): Promise<StopResult | null> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const recorder = mediaRecorder;
     mediaRecorder = null;
     if (!recorder || recorder.state === "inactive") {
@@ -135,25 +141,21 @@ function stopListeningWhisper(): Promise<StopResult | null> {
     }
     const handleStop = async () => {
       recorder.stream?.getTracks?.()?.forEach((t) => t.stop());
-      // Polyfill encoder is async; native may need a tick. Wait for final data.
       await new Promise((r) => setTimeout(r, 150));
       const chunks = audioChunks.filter((c) => c.size > 0);
       if (chunks.length === 0) {
         resolve({ error: "Microphone didn't capture any audio." });
         return;
       }
-      // Merge ALL chunks — previous code used only the largest, losing audio
       const blob = new Blob(chunks, { type: whisperMimeType });
-      const ext = whisperMimeType === "audio/wav" ? "wav" : "webm";
       try {
         const bytes = new Uint8Array(await blob.arrayBuffer());
-        const filename = `${AUDIO_TEMP_FILE}.${ext}`;
-        await writeFile(filename, bytes, { baseDir: BaseDirectory.AppCache });
-        resolve({ filename, mimeType: whisperMimeType });
+        const base64 = bytesToBase64(bytes);
+        resolve({ base64, mimeType: whisperMimeType });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        console.error("[whisper] write file error:", msg);
-        reject(new Error(`Could not save audio: ${msg}`));
+        console.error("[whisper] encode error:", msg);
+        resolve({ error: `Could not encode audio: ${msg}` });
       }
     };
     recorder.addEventListener("stop", handleStop, { once: true });
@@ -214,9 +216,9 @@ icon.addEventListener("pointerdown", async (e) => {
         speak(result.error);
         return;
       }
-      const txt = await invoke<string>("transcribe_audio_file", {
-        filename: result.filename,
-        mime_type: result.mimeType,
+      const txt = await invoke<string>("transcribe_audio", {
+        base64Audio: result.base64,
+        mimeType: result.mimeType,
       });
       if (txt && txt !== lastProcessed) {
         lastProcessed = txt;

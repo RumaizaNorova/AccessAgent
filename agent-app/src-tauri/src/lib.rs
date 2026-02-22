@@ -1,6 +1,20 @@
+use base64::{
+    engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig},
+    Engine,
+};
 use reqwest::multipart;
 use std::process::Command;
 use tauri::Manager;
+
+fn decode_base64_audio(s: &str) -> Result<Vec<u8>, String> {
+    let engine = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    engine.decode(s).map_err(|e| format!("Invalid base64: {}", e))
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct OpenAIMessage {
@@ -120,26 +134,12 @@ async fn whisper_available() -> bool {
     std::env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false)
 }
 
-/// Transcribe audio from a file in the app cache. Avoids base64/IPC size limits.
+/// Transcribe audio from base64-encoded bytes (frontend sends directly over IPC).
 #[tauri::command]
-async fn transcribe_audio_file(
-    app: tauri::AppHandle,
-    filename: String,
-    mime_type: Option<String>,
-) -> Result<String, String> {
-    let cache_dir = app
-        .path()
-        .app_cache_dir()
-        .map_err(|e| format!("Cache dir: {}", e))?;
-    let path = cache_dir.join(&filename);
-
-    let audio_bytes = std::fs::read(&path).map_err(|e| {
-        let msg = format!("Read audio file failed: {}", e);
-        eprintln!("[transcribe] {}", msg);
-        msg
-    })?;
-    let _ = std::fs::remove_file(&path);
-
+async fn transcribe_audio(base64_audio: String, mime_type: Option<String>) -> Result<String, String> {
+    let base64_trimmed = base64_audio.trim().replace('\r', "").replace('\n', "");
+    let audio_bytes = decode_base64_audio(&base64_trimmed)
+        .map_err(|e| format!("Invalid audio data: {}", e))?;
     send_audio_to_whisper(&audio_bytes, mime_type.as_deref()).await
 }
 
@@ -236,20 +236,20 @@ async fn open_app(name: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Load .env from agent-app/ (parent of src-tauri)
+    // Load .env from agent-app/ — use _override so .env wins over any stale shell env var
     if let Some(manifest_dir) = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
         let env_path = manifest_dir.join(".env");
-        let _ = dotenvy::from_path(env_path);
+        if env_path.exists() {
+            let _ = dotenvy::from_path_override(&env_path);
+        }
     }
-    let _ = dotenvy::dotenv();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_stt::init())
-        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             parse_intent,
             whisper_available,
-            transcribe_audio_file,
+            transcribe_audio,
             open_url,
             open_app
         ])
