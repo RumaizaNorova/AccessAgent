@@ -19,7 +19,7 @@ function scheduleExtensionTimeout() {
   if (extensionResultTimeoutId) clearTimeout(extensionResultTimeoutId);
   extensionResultTimeoutId = setTimeout(() => {
     extensionResultTimeoutId = null;
-    speak("Extension didn't respond. Start the agent first, refresh the tab, then try again.");
+    speak("Extension didn't respond. Click the extension icon to wake it, refresh the tab, then try again.");
   }, EXTENSION_TIMEOUT_MS);
 }
 

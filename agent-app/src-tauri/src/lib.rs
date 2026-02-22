@@ -5,6 +5,7 @@ use base64::{
 use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, Mutex};
@@ -255,10 +256,13 @@ async fn open_app(name: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Send command to extension via WebSocket bridge. Returns true if sent, false if no extension connected.
+/// Send command to extension via WebSocket bridge. Returns true if sent to at least one connected extension.
 #[tauri::command]
 async fn send_to_extension(command: String, app: tauri::AppHandle) -> Result<bool, String> {
     let state = app.state::<ExtensionBridge>();
+    if state.client_count.load(Ordering::SeqCst) == 0 {
+        return Ok(false);
+    }
     let tx = state.tx.lock().await;
     if let Some(sender) = tx.as_ref() {
         sender
@@ -273,6 +277,7 @@ async fn send_to_extension(command: String, app: tauri::AppHandle) -> Result<boo
 
 struct ExtensionBridge {
     tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>,
+    client_count: Arc<AtomicUsize>,
 }
 
 const WS_PORT: u16 = 8765;
@@ -288,8 +293,10 @@ pub fn run() {
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>(32);
+    let client_count = Arc::new(AtomicUsize::new(0));
     let bridge = ExtensionBridge {
         tx: Arc::new(tokio::sync::Mutex::new(Some(cmd_tx))),
+        client_count: Arc::clone(&client_count),
     };
 
     tauri::Builder::default()
@@ -299,8 +306,9 @@ pub fn run() {
         .setup(move |app| {
             let app_handle = app.handle().clone();
             let mut cmd_rx = cmd_rx;
+            let client_count = Arc::clone(&client_count);
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_ws_bridge(&app_handle, &mut cmd_rx).await {
+                if let Err(e) = run_ws_bridge(&app_handle, &mut cmd_rx, client_count).await {
                     eprintln!("[bridge] ws server error: {}", e);
                 }
             });
@@ -326,6 +334,7 @@ type WsWriter = futures_util::stream::SplitSink<
 async fn run_ws_bridge(
     app: &tauri::AppHandle,
     cmd_rx: &mut mpsc::Receiver<String>,
+    client_count: Arc<AtomicUsize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
@@ -347,6 +356,7 @@ async fn run_ws_bridge(
                         if sender.send(msg.clone()).await.is_ok() {
                             ok.push(sender);
                         }
+                        // Don't decrement here — read loop already does when client disconnects
                     }
                     *cl = ok;
                 }
@@ -355,7 +365,10 @@ async fn run_ws_bridge(
                 if let Ok(ws) = accept_async(stream).await {
                     let (write, mut read) = ws.split();
                     clients_send.lock().await.push(write);
+                    client_count.fetch_add(1, Ordering::SeqCst);
+                    eprintln!("[bridge] Extension connected ({} total)", client_count.load(Ordering::SeqCst));
                     let app = app.clone();
+                    let client_count = Arc::clone(&client_count);
                     tauri::async_runtime::spawn(async move {
                         while let Some(Ok(msg)) = read.next().await {
                             if let Message::Text(text) = msg {
@@ -365,6 +378,8 @@ async fn run_ws_bridge(
                                 }
                             }
                         }
+                        client_count.fetch_sub(1, Ordering::SeqCst);
+                        eprintln!("[bridge] Extension disconnected");
                     });
                 }
             }
