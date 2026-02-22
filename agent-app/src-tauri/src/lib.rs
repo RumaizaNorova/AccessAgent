@@ -51,6 +51,9 @@ pub struct Step {
 pub struct ParsedIntent {
     /// Plan: one or more steps. Compound commands ("open Wikipedia and search for X") = multiple steps.
     pub steps: Vec<Step>,
+    /// When present, the user intent is conversational (not a command). Speak this reply instead of executing steps.
+    #[serde(default)]
+    pub chat_reply: Option<String>,
 }
 
 #[tauri::command]
@@ -70,24 +73,42 @@ async fn parse_intent(
         String::new()
     };
 
-    let system_prompt = r#"You are a smart assistant that turns natural speech into executable plans for users who cannot use mouse/keyboard. INFER what they mean—don't match keywords. Use common sense.
+    let system_prompt = r#"You are a smart assistant for users who cannot use mouse/keyboard. Classify intent: CONVERSATIONAL or COMMAND.
 
-Return ONLY valid JSON (no markdown, no explanation):
-{"steps": [{"action": string, "payload": string, "target_type": "website"|"native_app"|null}, ...]}
+FIRST: Is this conversational (small talk, greetings, feelings, or questions that don't map to actions)?
+Use chat_reply ONLY when:
+- Greetings: "hi", "hello", "how are you", "good morning"
+- Small talk: "what's your name", "tell me about yourself", "that's funny"
+- Feelings/venting: "I'm frustrated", "this is confusing", "I'm tired"
+- Open questions without action: "what do you think", "why is that"
+- Filler: "ok", "umm", "thanks" (brief friendly acknowledgment)
+
+Use steps (COMMAND) when the user wants to DO something:
+- Navigate: "open X", "go to Y", "search for Z"
+- On-page: "find X", "click Y", "scroll down", "type Z"
+- System: "what time is it", "what's the date", "stop"
+- Keyboard: "save", "close this app", "press Enter"
+
+Output EITHER chat_reply OR steps, NEVER both.
+
+If CONVERSATIONAL → return: {"chat_reply": "your brief, friendly, natural reply (1-2 sentences max)"}
+If COMMAND → return: {"steps": [{"action": string, "payload": string, "target_type": "website"|"native_app"|null}, ...]}
 
 ACTIONS: open, search, time, date, stop, click, find, find_and_read, find_next, find_prev, page_search, scroll, go_to, access_mode, close_popup, open_and_search, press_keys.
 
-NATIVE APPS (use target_type: "native_app"): Slack, Mail, Notes, Messages, Finder, Terminal, System Settings, Calendar, Reminders, Safari, Discord, Zoom, Spotify, Microsoft Teams, Outlook, OneNote, Notion, Visual Studio Code, Xcode. Map: "email"→Mail, "messages"→Messages, "notes"→Notes, "finder"→Finder, "settings"→System Settings, "calendar"→Calendar, "reminders"→Reminders, "vs code"→Visual Studio Code. For these, payload = exact app name (e.g. "Mail", "Slack").
+NATIVE APPS (target_type: "native_app"): Slack, Mail, Notes, Messages, Finder, Terminal, System Settings, Calendar, Reminders, Safari, Discord, Zoom, Spotify, Microsoft Teams, Outlook, OneNote, Notion, Visual Studio Code, Xcode. Map: "email"→Mail, "messages"→Messages, "notes"→Notes, "finder"→Finder, "settings"→System Settings, "calendar"→Calendar, "reminders"→Reminders, "vs code"→Visual Studio Code. Payload = exact app name.
 
-KEYBOARD: "press Command S", "save", "press Enter", "press Tab", "press Escape" = press_keys. Payload format: "Command+S", "Enter", "Tab", "Escape", "Command+Shift+Z". Common: save=Command+S, close=Escape, undo=Command+Z, redo=Command+Shift+Z.
+KEYBOARD (press_keys): "press Command S", "save", "press Enter", "press Tab" = press_keys. Payload: "Command+S", "Enter", "Tab", "Escape", "Command+Q".
+- QUIT APP: "close [App]", "quit [App]", "exit Mail" = press_keys "Command+Q". NEVER use "stop" for quit.
+- CLOSE DIALOG: "close", "dismiss" = close_popup or press_keys "Escape".
+- Other: save=Command+S, undo=Command+Z, redo=Command+Shift+Z.
 
 USE PAGE CONTEXT (you get current URL when available):
-- youtube.com: "first video" / "click the second one" / "click that" / "open it" / "play that" = click "first video", "second video". Never "open" when they mean click an item on the page.
-- CRITICAL on youtube.com: When user picks a video ("that one", "first", "this", "it", "the cat video") → use click "first video", "second video", etc. NEVER use "youtube home", "home", or "logo" as payload—that goes to homepage, not the video.
-- wikipedia.org or articles: "find X on this page" / "scroll to X" = find_and_read X.
-- "Type X" / "write X" / "search here for X" = page_search X. "Send" = click send/submit.
-- Locating info ON the page = find, find_and_read, go_to. Web search = search. Ambiguous → on-page.
-- Extract concepts: "the thing about money" → "price". "When it's due" → "deadline". Never vague payloads."#;
+- youtube.com: "first video", "click the second one" = click "first video", "second video". NEVER "youtube home" or "logo".
+- wikipedia.org or articles: "find X", "scroll to X" = find_and_read X.
+- "Type X", "search here for X" = page_search X. "Send" = click send/submit.
+- On-page locate = find, find_and_read, go_to. Web search = search. Ambiguous → on-page.
+- Extract concepts: "the thing about money" → "price". "When it's due" → "deadline"."#;
 
     let user_content = if page_context.is_empty() {
         command.clone()
@@ -127,8 +148,20 @@ USE PAGE CONTEXT (you get current URL when available):
         .and_then(|c| c.message.content.as_ref())
         .ok_or("No response from OpenAI")?;
 
-    // Support both formats: {"steps": [...]} or legacy {"action", "payload"}
+    // Support: {"chat_reply": "..."} (conversational) OR {"steps": [...]} / {"action", "payload"} (commands)
     let value: serde_json::Value = serde_json::from_str(content).map_err(|e| format!("Parse error: {}", e))?;
+
+    // Conversational intent: return immediately, no steps
+    if let Some(reply) = value.get("chat_reply").and_then(|v| v.as_str()) {
+        let reply = reply.trim().to_string();
+        if !reply.is_empty() {
+            return Ok(ParsedIntent {
+                steps: vec![],
+                chat_reply: Some(reply),
+            });
+        }
+    }
+
     let mut steps = if let Some(arr) = value.get("steps").and_then(|v| v.as_array()) {
         arr.iter()
             .filter_map(|s| {
@@ -150,13 +183,11 @@ USE PAGE CONTEXT (you get current URL when available):
             target_type: value.get("target_type").and_then(|v| v.as_str()).map(String::from),
         }]
     } else {
-        return Ok(ParsedIntent {
-            steps: vec![Step {
-                action: "search".to_string(),
-                payload: command,
-                target_type: None,
-            }],
-        });
+        vec![Step {
+            action: "search".to_string(),
+            payload: command,
+            target_type: None,
+        }]
     };
 
     let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to", "press_keys"];
@@ -176,7 +207,31 @@ USE PAGE CONTEXT (you get current URL when available):
         }
     }
 
-    Ok(ParsedIntent { steps })
+    // GPT sometimes outputs [click first video, open youtube]. The open would navigate to home
+    // and undo the video — remove the redundant open when we have both and we're on YouTube.
+    let on_youtube = page_context.contains("youtube.com") || page_context.contains("youtu.be");
+    let has_video_click = steps.iter().any(|s| {
+        s.action.eq_ignore_ascii_case("click")
+            && (s.payload.to_lowercase().contains("video") || s.payload.to_lowercase().contains("first") || s.payload.to_lowercase().contains("second"))
+    });
+    let opens_youtube = |s: &Step| {
+        if !s.action.eq_ignore_ascii_case("open") {
+            return false;
+        }
+        let p = s.payload.trim().to_lowercase();
+        p == "youtube" || p == "youtube.com" || p == "the youtube" || p.starts_with("youtube ")
+    };
+    if on_youtube && has_video_click {
+        steps.retain(|s| !opens_youtube(s));
+    }
+
+    // "close Slack", "quit the app", "exit Mail" etc. → press_keys Command+Q (GPT sometimes misses these)
+    correct_quit_app(&command, &mut steps);
+
+    Ok(ParsedIntent {
+        steps,
+        chat_reply: None,
+    })
 }
 
 /// GPT picks the best-matching section from page headings given user intent.
@@ -383,6 +438,41 @@ fn correct_youtube_click_payload(payload: &str, page_url: &str) -> String {
     } else {
         payload.to_string()
     }
+}
+
+/// "close Slack", "quit the app", "exit Mail" → press_keys Command+Q. GPT wrongly outputs "stop" for these.
+fn correct_quit_app(command: &str, steps: &mut Vec<Step>) {
+    let c = command.trim().to_lowercase();
+    if c.is_empty() {
+        return;
+    }
+    // Don't touch "close popup", "close the popup", "dismiss" — those are close_popup
+    if c.contains("popup") || c.contains("dialog") || c.contains("modal") || c == "dismiss" {
+        return;
+    }
+    // GPT outputs "stop" for "close the notion app" etc. — convert to Command+Q
+    let has_quit_word = c.contains("close") || c.contains("quit") || c.contains("exit") || c.contains("kill");
+    let has_app_word = c.contains(" app") || c.ends_with(" app")
+        || ["slack", "mail", "messages", "notion", "chrome", "safari", "notes", "discord", "zoom", "spotify", "teams", "outlook", "finder", "terminal"]
+            .iter()
+            .any(|w| c.contains(w));
+    let looks_like_quit_app = has_quit_word && (has_app_word || c == "quit" || c == "exit");
+    if !looks_like_quit_app {
+        return;
+    }
+    let already_has_quit = steps.iter().any(|s| {
+        s.action.eq_ignore_ascii_case("press_keys")
+            && (s.payload.contains("Command+Q") || s.payload.contains("Meta+Q"))
+    });
+    if already_has_quit {
+        return;
+    }
+    // Replace wrong "stop" (or any wrong step) with Command+Q
+    *steps = vec![Step {
+        action: "press_keys".to_string(),
+        payload: "Command+Q".to_string(),
+        target_type: None,
+    }];
 }
 
 /// Format a step for the extension (matches main.ts formatExtensionCommand).
@@ -652,6 +742,25 @@ async fn handle_parse_and_run(
             return;
         }
     };
+
+    // Conversational intent: speak reply and send to extension for palette display
+    if let Some(ref reply) = intent.chat_reply {
+        let reply = reply.trim();
+        if !reply.is_empty() {
+            let _ = app.emit("extension-result", reply);
+            let msg = tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({ "type": "CHAT_REPLY", "message": reply }).to_string(),
+            );
+            let mut cl = clients.lock().await;
+            for mut sender in std::mem::take(&mut *cl) {
+                if sender.send(msg.clone()).await.is_ok() {
+                    cl.push(sender);
+                }
+            }
+            return;
+        }
+    }
+
     let mut just_opened_url = false;
     for step in &intent.steps {
         let action = step.action.to_lowercase();

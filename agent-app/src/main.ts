@@ -32,12 +32,17 @@ function shortenForTts(msg: string): string {
 }
 
 type Step = { action: string; payload: string; target_type?: string };
-async function parseCommand(text: string): Promise<{ steps: Step[] }> {
-  const intent = await invoke<{ steps: Array<{ action: string; payload: string; target_type?: string }> }>("parse_intent", {
+type ParsedIntent = { steps: Step[]; chat_reply?: string | null };
+
+async function parseCommand(text: string): Promise<ParsedIntent> {
+  const intent = await invoke<ParsedIntent>("parse_intent", {
     command: text,
     apiKeyOverride: null,
   });
-  return { steps: intent.steps || [] };
+  return {
+    steps: intent.steps || [],
+    chat_reply: intent.chat_reply ?? null,
+  };
 }
 
 function resolveUrl(payload: string): string {
@@ -206,7 +211,14 @@ function normalizeKeyCombo(p: string): string {
 }
 
 async function runCommand(text: string) {
-  const { steps } = await parseCommand(text);
+  const { steps, chat_reply } = await parseCommand(text);
+
+  // Conversational intent: speak reply and return (no steps to execute)
+  if (chat_reply?.trim()) {
+    speak(chat_reply.trim());
+    return;
+  }
+
   if (!steps.length) {
     speak("I didn't understand. Try: open Wikipedia and search for something.");
     return;
@@ -269,7 +281,7 @@ function getMediaRecorderConstructor(): typeof MediaRecorder {
 }
 
 const CHUNK_INTERVAL_MS = 100;
-const SILENCE_MS = 1200; // Auto-stop after 1.2s silence (no second tap needed)
+const SILENCE_MS = 2000; // Auto-stop after 2s silence (allow "close the messages app" etc. to finish)
 const SILENCE_CHECK_MS = 100;
 
 async function startListeningWhisper(onSilence?: () => void) {
@@ -443,8 +455,10 @@ let lastFocusedAppBundleId: string | null = null;
 // Global hotkey: Option+Space — summon agent and start listening from anywhere
 import("@tauri-apps/plugin-global-shortcut")
   .then(({ register }) =>
-    register("Alt+Space", async () => {
-      // Capture frontmost app BEFORE we steal focus
+    register("Alt+Space", async (event) => {
+      // Ignore release — shortcut fires on press AND release; release was stopping recording
+      if (event.state !== "Pressed") return;
+      // Capture frontmost app so press_keys goes there, not to us. Don't steal focus.
       try {
         const bundleId = await invoke<string | null>("get_frontmost_app");
         if (bundleId && !bundleId.toLowerCase().includes("accesspilot")) {
@@ -453,7 +467,6 @@ import("@tauri-apps/plugin-global-shortcut")
       } catch {
         // ignore
       }
-      getCurrentWindow().setFocus().catch(() => {});
       startListening();
     })
   )
