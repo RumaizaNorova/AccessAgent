@@ -597,10 +597,16 @@ function applyMode(mode: InputMode) {
         <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
       </svg>`;
     speak("Voice mode. Tap or press Option+Space to talk.");
-  } else {
+  } else if (mode === "gaze") {
     agentMain.querySelector("#icon")!.innerHTML = `
       <svg viewBox="0 0 24 24" fill="currentColor" width="40" height="40">
         <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+      </svg>`;
+    speak("Gaze mode. Open Chrome, go to a webpage, then click Start Gaze in the bottom right. Allow camera. Then look at buttons to click.");
+  } else {
+    agentMain.querySelector("#icon")!.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="currentColor" width="40" height="40">
+        <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3-1.34-3-3-3z"/>
       </svg>`;
     speak("Gaze mode. Open Chrome, go to a webpage, then click Start Gaze in the bottom right. Allow camera. Then look at buttons to click.");
   }
