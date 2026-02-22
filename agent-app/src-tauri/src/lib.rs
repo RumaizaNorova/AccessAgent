@@ -209,7 +209,7 @@ CRITICAL: CONVERSATION vs COMMAND
 - Page URL does NOT change this. User on Google saying "hi" = CONVERSATION.
 - When unsure → CONVERSATION. Err on the side of talking, not searching. Single greetings = always conversation.
 
-Output ONLY one:
+Output ONLY valid JSON. Reply with exactly one JSON object, no other text.
 1. CONVERSATION: {"intent":"conversation","chat_reply":"your friendly reply"}
 2. COMMAND: {"intent":"command","steps":[{"action","payload","target_type"}]}
 
@@ -307,7 +307,7 @@ PAGE CONTEXT (when URL given): youtube.com→click "first video" not logo; wikip
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("OpenAI API error ({}): {}", status, text));
+        return Err(extract_openai_error_message(&text, status.as_u16()));
     }
 
     let body: OpenAIResponse = res.json().await.map_err(|e| e.to_string())?;
@@ -409,12 +409,12 @@ PAGE CONTEXT (when URL given): youtube.com→click "first video" not logo; wikip
     // Last-resort: model wrongly returned search/find with user's exact words — that's almost always convo
     let single_action = steps.len() == 1;
     let payload_matches_user = single_action
-        && normalize_for_check(&steps[0].payload) == normalize_for_check(command);
+        && normalize_for_check(&steps[0].payload) == normalize_for_check(&command);
     let action_is_search_or_find = single_action
         && (steps[0].action.eq_ignore_ascii_case("search") || steps[0].action.eq_ignore_ascii_case("find"));
     if payload_matches_user && action_is_search_or_find {
         // User said "Hi!" and we got search "Hi!" — clearly wrong. Reply conversationally.
-        let norm = normalize_for_check(command);
+        let norm = normalize_for_check(&command);
         let reply = if norm.contains("how are you") || norm.contains("how're you") {
             "I'm doing well, thanks for asking! How can I help?"
         } else if norm.contains("whats up") || norm.contains("what's up") {
@@ -502,7 +502,7 @@ fn extract_openai_error_message(body: &str, status: u16) -> String {
             return msg.to_string();
         }
     }
-    format!("Whisper API error: status {}", status)
+    format!("OpenAI API error: status {}", status)
 }
 
 /// Check if Whisper transcription is available (API key set)

@@ -15,9 +15,9 @@
       {
         "label": "main",
         "title": "AccessPilot",
-        "width": 280,
-        "height": 180,
-        "minWidth": 120,
+        "width": 260,
+        "height": 160,
+        "minWidth": 100,
         "minHeight": 100,
         "resizable": true,
         "decorations": false,

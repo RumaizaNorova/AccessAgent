@@ -68,7 +68,7 @@ Done. The extension connects to the agent automatically.
 
 **Press keys:** Commands like "press Command S", "save", "press Enter" simulate keystrokes. Requires **Accessibility** permission. Use `npm run tauri:dev:ax` instead of `npm run tauri dev` (add AccessPilot-debug.app to Accessibility first; run `./scripts/make-debug-app.sh` once after first build).
 
-**Gaze mode:** Uses your webcam to track where you look. Look at a button/link for ~2 seconds to click it. Best on well-lit pages. Click a few spots to calibrate. You can also set input mode in the Chrome extension popup.
+**Gaze mode:** Uses your webcam to track where you look. Look at a button/link for ~2 seconds to click it. **Calibrate first** (click the 9 dots after Start Gaze). See [docs/GAZE_SETUP.md](../docs/GAZE_SETUP.md) for setup tips (lighting, camera position).
 
 ---
 
