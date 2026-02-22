@@ -30,18 +30,25 @@ function shortenForTts(msg: string): string {
   return s.slice(0, 77) + "...";
 }
 
-async function parseCommand(text: string): Promise<{ type: string; payload: string }> {
-  const intent = await invoke<{ action: string; payload: string }>("parse_intent", {
+type Step = { action: string; payload: string; target_type?: string };
+async function parseCommand(text: string): Promise<{ steps: Step[] }> {
+  const intent = await invoke<{ steps: Array<{ action: string; payload: string; target_type?: string }> }>("parse_intent", {
     command: text,
     apiKeyOverride: null,
   });
-  return { type: intent.action, payload: intent.payload || "" };
+  return { steps: intent.steps || [] };
 }
 
 function resolveUrl(payload: string): string {
-  const p = payload.trim().toLowerCase();
-  if (/^https?:\/\//i.test(p)) return payload.trim();
-  if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(p)) return `https://${p}`;
+  const raw = payload.trim();
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(raw)) return `https://${raw}`;
+  // Normalize: "wikipedia web app", "the youtube", "open amazon" → extract site name
+  const p = raw
+    .toLowerCase()
+    .replace(/\b(the|web|site|app|page|website)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
   const known: Record<string, string> = {
     amazon: "https://www.amazon.com",
     ebay: "https://www.ebay.com",
@@ -49,92 +56,117 @@ function resolveUrl(payload: string): string {
     wikipedia: "https://www.wikipedia.org",
     google: "https://www.google.com",
     youtube: "https://www.youtube.com",
+    netflix: "https://www.netflix.com",
+    reddit: "https://www.reddit.com",
+    facebook: "https://www.facebook.com",
+    twitter: "https://twitter.com",
+    instagram: "https://www.instagram.com",
+    linkedin: "https://www.linkedin.com",
+    gmail: "https://mail.google.com",
+    github: "https://github.com",
   };
-  if (known[p]) return known[p];
-  return `https://www.${p}.com`;
+  const key = p.split(/\s+/)[0] || p;
+  if (known[key]) return known[key];
+  return `https://www.${key}.com`;
+}
+
+const PAGE_LOAD_DELAY_MS = 3500;
+const extensionActions = ["click", "find", "find_and_read", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
+
+async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "done"> {
+  const { action: type, payload: p, target_type } = step;
+
+  if (type === "time") {
+    const now = new Date();
+    speak(`The time is ${now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`);
+    return "done";
+  }
+  if (type === "date") {
+    const now = new Date();
+    speak(`Today is ${now.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" })}`);
+    return "done";
+  }
+  if (type === "stop") {
+    speak("Stopped");
+    return "done";
+  }
+  if (type === "open") {
+    const payload = p.trim();
+    const looksLikeInPage = /\b(first|second|third|this|that)\s*(one|video|result|item)?\b/i.test(payload) || /\bvideo\b/i.test(payload);
+    if (looksLikeInPage) {
+      const sent = await invoke<boolean>("send_to_extension", { command: `click ${payload}` });
+      if (!sent) speak("Install the AccessPilot Chrome extension and refresh your tab.");
+      else {
+        pendingGoToIntent = null;
+        scheduleExtensionTimeout();
+      }
+      return "sent_to_ext";
+    }
+    const wantsNativeApp = target_type === "native_app";
+    if (wantsNativeApp) {
+      try {
+        await invoke("open_app", { name: payload });
+      } catch {
+        await invoke("open_url", { url: resolveUrl(payload) });
+      }
+    } else {
+      await invoke("open_url", { url: resolveUrl(payload) });
+    }
+    speak(`Opening ${payload}`);
+    return "opened_url";
+  }
+  if (type === "search") {
+    await invoke("open_url", { url: `https://duckduckgo.com/?q=${encodeURIComponent(p)}` });
+    speak(`Searching for ${p}`);
+    return "opened_url";
+  }
+  if (type === "open_and_search") {
+    const [site, ...rest] = p.split("|").map((s) => s.trim());
+    const query = rest.join("|").trim();
+    if (!site || !query) {
+      speak("Try: open Amazon and search for candles.");
+      return "done";
+    }
+    await invoke("open_url", { url: resolveUrl(site) });
+    speak("Opening. Searching in a moment.");
+    await new Promise((r) => setTimeout(r, PAGE_LOAD_DELAY_MS));
+    const sent = await invoke<boolean>("send_to_extension", { command: `search for ${query}` });
+    if (!sent) speak("Install the AccessPilot extension for in-page search.");
+    else scheduleExtensionTimeout();
+    return "done";
+  }
+  if (extensionActions.includes(type)) {
+    const extCmd = formatExtensionCommand(type, p);
+    const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
+    if (!sent) speak("Install the AccessPilot Chrome extension and refresh your tab, then try again.");
+    else {
+      if (type === "go_to") pendingGoToIntent = p;
+      scheduleExtensionTimeout();
+    }
+    return "sent_to_ext";
+  }
+  return "done";
 }
 
 async function runCommand(text: string) {
-  const parsed = await parseCommand(text);
+  const { steps } = await parseCommand(text);
+  if (!steps.length) {
+    speak("I didn't understand. Try: open Wikipedia and search for something.");
+    return;
+  }
 
-  if (parsed.type === "time") {
-    const now = new Date();
-    const time = now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    speak(`The time is ${time}`);
-    return;
-  }
-  if (parsed.type === "date") {
-    const now = new Date();
-    const date = now.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
-    speak(`Today is ${date}`);
-    return;
-  }
-  if (parsed.type === "stop") {
-    speak("Stopped");
-    return;
-  }
-  if (parsed.type === "open") {
-    const p = parsed.payload;
-    const knownApps = ["chrome", "safari", "firefox", "spotify", "slack", "mail", "notes"];
-    if (!p.includes(".") && (knownApps.includes(p.toLowerCase()) || /^[A-Z]/.test(p))) {
-      try {
-        await invoke("open_app", { name: p });
-        speak(`Opening ${p}`);
-      } catch {
-        const url = resolveUrl(p);
-        await invoke("open_url", { url });
-        speak(`Opening ${p}`);
-      }
-    } else {
-      const url = resolveUrl(p);
-      await invoke("open_url", { url });
-      speak(`Opening ${p}`);
+  let justOpenedUrl = false;
+  for (const step of steps) {
+    if (justOpenedUrl && extensionActions.includes(step.action)) {
+      speak("Loading. Give it a moment.");
+      await new Promise((r) => setTimeout(r, PAGE_LOAD_DELAY_MS));
+      justOpenedUrl = false;
     }
-    return;
+    const result = await executeStep(step);
+    justOpenedUrl = result === "opened_url";
   }
-  if (parsed.type === "search") {
-    const url = `https://duckduckgo.com/?q=${encodeURIComponent(parsed.payload)}`;
-    await invoke("open_url", { url });
-    speak(`Searching for ${parsed.payload}`);
-    return;
-  }
-
-  // open_and_search: open site, wait for load, then search on it (one phrase does both)
-  if (parsed.type === "open_and_search") {
-    const parts = parsed.payload.split("|").map((s) => s.trim());
-    const site = parts[0] || "";
-    const query = parts.slice(1).join("|").trim();
-    if (!site || !query) {
-      speak("Try: open Amazon and search for candles.");
-      return;
-    }
-    const url = resolveUrl(site);
-    await invoke("open_url", { url });
-    speak("Opening. Searching in a moment.");
-    await new Promise((r) => setTimeout(r, 3500));
-    const extCmd = `search for ${query}`;
-    const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
-    if (!sent) speak("Install the AccessPilot extension for in-page search.");
-    else scheduleExtensionTimeout();
-    return;
-  }
-
-  // In-page actions: click, find, page_search, scroll, access_mode, close_popup, go_to — send to extension
-  const extensionActions = ["click", "find", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
-  if (extensionActions.includes(parsed.type)) {
-    const extCmd = formatExtensionCommand(parsed.type, parsed.payload);
-    const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
-    if (!sent) {
-      speak("Install the AccessPilot Chrome extension and refresh your tab, then try again.");
-    } else {
-      if (parsed.type === "go_to") pendingGoToIntent = parsed.payload;
-      scheduleExtensionTimeout();
-    }
-    return;
-  }
-
-  speak("I didn't understand. Try: open wikipedia, click the buy button, or search for something.");
 }
+
 
 function formatExtensionCommand(action: string, payload: string): string {
   const p = payload.trim();
@@ -143,6 +175,8 @@ function formatExtensionCommand(action: string, payload: string): string {
       return `click ${p}`;
     case "find":
       return `find ${p}`;
+    case "find_and_read":
+      return `find_and_read ${p}`;
     case "page_search":
       return `search for ${p}`;
     case "scroll":

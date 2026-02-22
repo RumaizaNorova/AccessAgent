@@ -36,10 +36,18 @@ struct OpenAIResponse {
     choices: Vec<OpenAIChoice>,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ParsedIntent {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Step {
     pub action: String,
     pub payload: String,
+    #[serde(default)]
+    pub target_type: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ParsedIntent {
+    /// Plan: one or more steps. Compound commands ("open Wikipedia and search for X") = multiple steps.
+    pub steps: Vec<Step>,
 }
 
 #[tauri::command]
@@ -49,45 +57,32 @@ async fn parse_intent(command: String, api_key_override: Option<String>) -> Resu
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .ok_or("No API key. Set OPENAI_API_KEY env var or add your key in Settings.")?;
 
-    let system_prompt = r#"You are a smart command parser for a voice-controlled desktop accessibility agent. The user speaks naturally—your job is to understand intent, not just match keywords.
+    let system_prompt = r#"You are an intelligent assistant that turns natural speech into executable plans. The user speaks freely—understand intent and break compound requests into steps.
 
-Return ONLY valid JSON (no markdown, no explanation): {"action": string, "payload": string}
+Return ONLY valid JSON (no markdown, no explanation):
+{"steps": [{"action": string, "payload": string, "target_type": "website"|"native_app"|null}, ...]}
 
-Actions and payloads:
-- open: Launch an app, open a URL, or go to a website. payload = app name, URL, or site (e.g. "chrome", "spotify", "wikipedia", "youtube.com", "amazon")
-  Examples: "open chrome", "launch spotify", "go to wikipedia", "open up youtube", "start slack", "take me to google"
-- search: Web search (opens search engine). Use ONLY when user says "google", "search the web", "look up on the internet", or asks a general knowledge question. payload = search query
-  Examples: "google best headphones", "search the web for restaurants", "look up python tutorials online", "what is the capital of France"
-- time: Get the current time. payload = ""
-  Examples: "what time is it", "time", "current time", "what's the time"
-- date: Get today's date. payload = ""
-  Examples: "what's the date", "date", "what day is it", "today's date"
-- stop: Cancel or stop. payload = ""
-  Examples: "stop", "cancel", "never mind", "forget it"
-- click: Click a button, link, or element on the current webpage. payload = what to click. Supports ordinals: "first", "second", "third", "the second one", "2nd item"
-  Examples: "click the buy button", "choose the second one", "select the third item", "pick the first result", "click submit", "click continue"
-- find: Find and highlight text or element on the page (scroll to it). payload = what to find
-  Examples: "find login", "find the requirements", "scroll to contact", "show me the price"
-- page_search: Search box ON THE CURRENT PAGE (e.g. Amazon, any site). Use when user says "search for X", "look for X", "find X", or "on this page/search here/on the site I'm on" + search. payload = search query only (e.g. "candles")
-  Examples: "search for candles", "search for shoes", "on this page search for candles", "on the website I'm on search for candles", "see the page I'm at and search for X" → page_search with payload "X"
-- scroll: Scroll the page. payload = "direction" or "direction:amount". direction = up|down|top|bottom. amount = optional: "2", "3pages", "2pages", "little"(0.5), "lot"(2)
-  Examples: "scroll down" → "down", "scroll down three pages" → "down:3pages", "scroll up 2 pages" → "up:2pages", "scroll to top" → "top", "scroll to bottom" → "bottom", "scroll a little" → "down:little"
-- access_mode: Toggle one-hand / target boost mode. payload = "on" or "off"
-  Examples: "access mode on", "target boost off"
-- close_popup: Close/dismiss the visible popup, modal, or dialog. payload = ""
-  Examples: "close popup", "dismiss", "close the dialog", "close"
-- go_to: Navigate to a section or part of the page by meaning. User describes what they want to see. payload = their exact phrase
-  Examples: "go to the part about his education", "show me his early life", "find where it talks about his career", "take me to the section on awards", "where does it mention his education"
-- open_and_search: Open a website THEN search on it. payload = "site|query" (e.g. "amazon|candles", "wikipedia|Albert Einstein"). Site can be "amazon", "amazon.com", "wikipedia", etc.
-  Examples: "open Amazon and search for candles", "go to Amazon and look for shoes", "open Wikipedia and search for Einstein", "take me to eBay and search for headphones"
+AVAILABLE ACTIONS (use whichever fit the intent):
+- open: Go to a website or launch app. payload = site name (youtube, wikipedia, amazon...). target_type: "website" (default) or "native_app" for desktop apps only.
+- search: Web search (DuckDuckGo). payload = query
+- time, date, stop: payload = ""
+- click: Click/play/select on the CURRENT PAGE. payload = what to click (preserve ordinals: first video, second result)
+- find: Find and highlight text on page. payload = phrase to find
+- find_and_read: Find text, scroll to it, read it aloud. payload = what to find (e.g. "price", "requirements", "deadline")
+- page_search: Type into search box ON the current page. payload = query
+- scroll: payload = "up"|"down"|"top"|"bottom" or "down:3pages"
+- go_to: Scroll to a section by meaning. payload = their phrase (e.g. "his education", "pricing")
+- access_mode: payload = "on"|"off"
+- close_popup: payload = ""
+- open_and_search: Open site THEN search on it. payload = "site|query"
 
-Rules:
-- open vs click: open = navigate to new URL or launch app. click = interact with element on current page.
-- search vs page_search: DEFAULT to page_search for "search for X" — user is usually on a site. Use search (web) only when they say "google", "on the web", or ask a knowledge question.
-- open_and_search: Use when user says "open X and search for Y" or "go to X and look for Y" — one command does both.
-- Understand synonyms: "launch", "go to" → open. "press", "hit", "choose", "select", "pick" → click. "find", "show me", "scroll to" → find.
-- go_to vs find: go_to = navigate to a SECTION of the page (headings like Education, Career). find = locate specific text and highlight it.
-- Preserve the user's exact words in payload when relevant."#;
+CRITICAL—PLANNING:
+- "Find info on Wikipedia about X and scroll to it" → steps: [open wikipedia] → [page_search X] → [find_and_read X]
+- "Open Amazon, search for shoes, click the first one" → steps: [open amazon] → [page_search shoes] → [click first result]
+- "Scroll down and show me the price" → steps: [scroll down] → [find_and_read price]
+- Single requests = one step. Compound requests = multiple steps in logical order.
+- Infer context: "search for it" on a product page = page_search. "search the web" = search.
+- Understand synonyms: "look up", "find", "get info on", "go to section" — map to the right action."#;
 
     let client = reqwest::Client::new();
     let res = client
@@ -101,7 +96,7 @@ Rules:
                 {"role": "user", "content": command}
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 256,
+            "max_tokens": 512,
             "temperature": 0.05
         }))
         .send()
@@ -121,20 +116,49 @@ Rules:
         .and_then(|c| c.message.content.as_ref())
         .ok_or("No response from OpenAI")?;
 
-    let intent: ParsedIntent = serde_json::from_str(content).map_err(|e| format!("Parse error: {}", e))?;
-
-    // Validate action (agent handles some, extension handles in-page)
-    let agent_actions = ["open", "search", "time", "date", "stop"];
-    let extension_actions = ["click", "find", "page_search", "scroll", "access_mode", "open_and_search", "close_popup", "go_to"];
-    let valid: Vec<&str> = agent_actions.iter().chain(extension_actions.iter()).copied().collect();
-    if !valid.contains(&intent.action.as_str()) {
+    // Support both formats: {"steps": [...]} or legacy {"action", "payload"}
+    let value: serde_json::Value = serde_json::from_str(content).map_err(|e| format!("Parse error: {}", e))?;
+    let mut steps = if let Some(arr) = value.get("steps").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|s| {
+                let obj = s.as_object()?;
+                Some(Step {
+                    action: obj.get("action")?.as_str()?.to_string(),
+                    payload: obj.get("payload").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    target_type: obj.get("target_type").and_then(|v| v.as_str()).map(String::from),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else if let (Some(action), payload) = (
+        value.get("action").and_then(|v| v.as_str()),
+        value.get("payload").and_then(|v| v.as_str()).unwrap_or(""),
+    ) {
+        vec![Step {
+            action: action.to_string(),
+            payload: payload.to_string(),
+            target_type: value.get("target_type").and_then(|v| v.as_str()).map(String::from),
+        }]
+    } else {
         return Ok(ParsedIntent {
+            steps: vec![Step {
+                action: "search".to_string(),
+                payload: command,
+                target_type: None,
+            }],
+        });
+    };
+
+    let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
+    steps.retain(|s| valid.contains(&s.action.as_str()));
+    if steps.is_empty() {
+        steps = vec![Step {
             action: "search".to_string(),
             payload: command,
-        });
+            target_type: None,
+        }];
     }
 
-    Ok(intent)
+    Ok(ParsedIntent { steps })
 }
 
 /// GPT picks the best-matching section from page headings given user intent.
