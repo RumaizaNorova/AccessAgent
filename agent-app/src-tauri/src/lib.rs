@@ -1,6 +1,20 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{
+    engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig},
+    Engine,
+};
+
+fn decode_base64_audio(s: &str) -> Result<Vec<u8>, String> {
+    let engine = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    engine.decode(s).map_err(|e| format!("Invalid base64: {}", e))
+}
 use reqwest::multipart;
 use std::process::Command;
+use tauri::Manager;
 
 #[derive(Debug, serde::Deserialize)]
 struct OpenAIMessage {
@@ -30,20 +44,29 @@ async fn parse_intent(command: String, api_key_override: Option<String>) -> Resu
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .ok_or("No API key. Set OPENAI_API_KEY env var or add your key in Settings.")?;
 
-    let system_prompt = r#"You are a command parser for a desktop accessibility agent. The user speaks or types a command. Your job is to extract the intent.
+    let system_prompt = r#"You are a smart command parser for a voice-controlled desktop accessibility agent. The user speaks naturally—your job is to understand intent, not just match keywords.
 
-Return ONLY valid JSON with exactly this shape (no markdown, no explanation):
-{"action": "open"|"search"|"time"|"date"|"stop", "payload": "string"}
+Return ONLY valid JSON (no markdown, no explanation): {"action": string, "payload": string}
+
+Actions and payloads:
+- open: Launch an app, open a URL, or go to a website. payload = app name, URL, or site (e.g. "chrome", "spotify", "wikipedia", "youtube.com", "amazon")
+  Examples: "open chrome", "launch spotify", "go to wikipedia", "open up youtube", "start slack", "take me to google"
+- search: Look something up on the web. payload = search query
+  Examples: "search for restaurants nearby", "look up python tutorials", "find hotels in Paris", "google best headphones", "what is the capital of France", "how do I fix a flat tire"
+- time: Get the current time. payload = ""
+  Examples: "what time is it", "time", "current time", "what's the time"
+- date: Get today's date. payload = ""
+  Examples: "what's the date", "date", "what day is it", "today's date"
+- stop: Cancel or stop. payload = ""
+  Examples: "stop", "cancel", "never mind", "forget it"
 
 Rules:
-- "open X" → action: "open", payload: X (URL, app name, or site like "wikipedia")
-- "search for X" or "look up X" → action: "search", payload: X
-- "what time is it" / "time" → action: "time", payload: ""
-- "what's the date" / "date" → action: "date", payload: ""
-- "stop" / "cancel" → action: "stop", payload: ""
-- If unclear but seems like opening something → "open"
-- If unclear but seems like search → "search"
-- Default for ambiguous: "search" with full input as payload"#;
+- Understand synonyms: "launch", "go to", "open up", "start", "take me to" → open. "look up", "find", "google", "search for" → search.
+- For questions like "what is X" or "how do I X" → search with the full question as payload.
+- Be generous with understanding: "play some music" → open spotify. "check my email" → open mail.
+- If the user names a website (e.g. "reddit", "github") → open with that as payload.
+- If truly ambiguous, prefer "search" with full input as payload.
+- Preserve the user's exact words in payload when relevant (e.g. search query)."#;
 
     let client = reqwest::Client::new();
     let res = client
@@ -51,14 +74,14 @@ Rules:
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
-            "model": "gpt-4o-mini",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": command}
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 128,
-            "temperature": 0.1
+            "max_tokens": 256,
+            "temperature": 0.05
         }))
         .send()
         .await
@@ -91,29 +114,97 @@ Rules:
     Ok(intent)
 }
 
+/// Extract error message from OpenAI API response. Surfaces the real error.
+fn extract_openai_error_message(body: &str, status: u16) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            return msg.to_string();
+        }
+    }
+    format!("Whisper API error: status {}", status)
+}
+
 /// Check if Whisper transcription is available (API key set)
 #[tauri::command]
 async fn whisper_available() -> bool {
     std::env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false)
 }
 
+/// Transcribe audio from a file in the app cache. Avoids base64/IPC size limits.
+#[tauri::command]
+async fn transcribe_audio_file(
+    app: tauri::AppHandle,
+    filename: String,
+    mime_type: Option<String>,
+) -> Result<String, String> {
+    let cache_dir = app
+        .path()
+        .cache_dir()
+        .map_err(|e| format!("Cache dir: {}", e))?;
+    let path = cache_dir.join(&filename);
+
+    let audio_bytes = std::fs::read(&path).map_err(|e| {
+        let msg = format!("Read audio file failed: {}", e);
+        eprintln!("[transcribe] {}", msg);
+        msg
+    })?;
+    let _ = std::fs::remove_file(&path);
+
+    send_audio_to_whisper(&audio_bytes, mime_type.as_deref()).await
+}
+
 /// Transcribe audio using OpenAI Whisper API. Accepts base64-encoded audio.
-/// Supported formats: webm, mp3, mp4, mpeg, mpga, m4a, wav
 #[tauri::command]
 async fn transcribe_audio(base64_audio: String, mime_type: Option<String>) -> Result<String, String> {
+    eprintln!("[transcribe] input len={}, mime={:?}", base64_audio.len(), mime_type);
+
     let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| "No API key. Set OPENAI_API_KEY env var.")?
+        .map_err(|_| {
+            let msg = "No API key. Set OPENAI_API_KEY env var.";
+            eprintln!("[transcribe] {}", msg);
+            msg.to_string()
+        })?
         .trim()
         .to_string();
     if api_key.is_empty() {
         return Err("No API key. Set OPENAI_API_KEY env var.".into());
     }
 
-    let audio_bytes = BASE64
-        .decode(&base64_audio)
-        .map_err(|e| format!("Invalid base64 audio: {}", e))?;
+    // Trim whitespace only - frontend sends clean base64 from btoa()
+    let base64_trimmed = base64_audio.trim().replace('\r', "").replace('\n', "");
+    eprintln!(
+        "[transcribe] input len={}, trimmed len={}, head={:?}",
+        base64_audio.len(),
+        base64_trimmed.len(),
+        base64_trimmed.chars().take(80).collect::<String>()
+    );
 
-    let (file_name, mime) = match mime_type.as_deref() {
+    let audio_bytes = decode_base64_audio(&base64_trimmed).map_err(|e| {
+        eprintln!("[transcribe] base64 error: {}", e);
+        e.to_string()
+    })?;
+    eprintln!("[transcribe] decoded {} bytes", audio_bytes.len());
+
+    send_audio_to_whisper(&audio_bytes, mime_type.as_deref()).await
+}
+
+async fn send_audio_to_whisper(
+    audio_bytes: &[u8],
+    mime_type: Option<&str>,
+) -> Result<String, String> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "No API key. Set OPENAI_API_KEY in .env.".to_string())?
+        .trim()
+        .to_string();
+    if api_key.is_empty() {
+        return Err("No API key. Set OPENAI_API_KEY in .env.".into());
+    }
+
+    let (file_name, mime) = match mime_type {
         Some("audio/webm") | None => ("audio.webm", "audio/webm"),
         Some("audio/mpeg") => ("audio.mp3", "audio/mpeg"),
         Some("audio/mp4") => ("audio.m4a", "audio/mp4"),
@@ -124,8 +215,8 @@ async fn transcribe_audio(base64_audio: String, mime_type: Option<String>) -> Re
     let form = multipart::Form::new()
         .part(
             "file",
-            multipart::Part::bytes(audio_bytes)
-                .file_name(file_name)
+            multipart::Part::bytes(audio_bytes.to_vec())
+                .file_name(file_name.to_string())
                 .mime_str(mime)
                 .map_err(|e| format!("Invalid MIME: {}", e))?,
         )
@@ -147,7 +238,8 @@ async fn transcribe_audio(base64_audio: String, mime_type: Option<String>) -> Re
     if !res.status().is_success() {
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
-        return Err(format!("Whisper API error ({}): {}", status, text));
+        eprintln!("[transcribe] Whisper API error {}: {}", status, text);
+        return Err(extract_openai_error_message(&text, status.as_u16()));
     }
 
     let text = res.text().await.map_err(|e| e.to_string())?;
@@ -202,10 +294,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_stt::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             parse_intent,
             whisper_available,
             transcribe_audio,
+            transcribe_audio_file,
             open_url,
             open_app
         ])
