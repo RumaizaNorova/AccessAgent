@@ -1,14 +1,27 @@
 # AccessPilot Agent
 
-A voice-controlled desktop agent — small floating icon. Click to talk, speak your command, click again to run it. Uses OpenAI Whisper for transcription and GPT-4o for natural-language understanding.
+A voice-controlled desktop agent for accessibility. Small floating icon — click to talk, speak your command, click again. Uses OpenAI Whisper + GPT-4o.
 
-## Prerequisites
+---
 
-1. **Rust** — [Install Rust](https://www.rust-lang.org/learn/get-started)
-2. **macOS** — Built for macOS
-3. **OpenAI API key** — Required. Set `OPENAI_API_KEY` in `agent-app/.env`. Get one at https://platform.openai.com/api-keys
+## One-Time Setup
 
-## Run
+Do this once. After that, the agent works whenever you run it.
+
+### 1. Prerequisites
+
+- **Rust** — [Install Rust](https://www.rust-lang.org/learn/get-started)
+- **macOS**
+- **Chrome** — For in-page actions (search on sites, click, find)
+
+### 2. OpenAI API Key
+
+1. Get a key at https://platform.openai.com/api-keys  
+2. Open `agent-app/.env`  
+3. Add: `OPENAI_API_KEY=sk-proj-your-key-here`  
+4. Save the file
+
+### 3. Install the Agent App
 
 ```bash
 cd agent-app
@@ -16,33 +29,52 @@ npm install
 npm run tauri dev
 ```
 
+A small blue mic icon appears. Leave it running.
+
+### 4. Install the Chrome Extension (for in-page actions)
+
+Required for: search on Amazon/sites, click, find, scroll.
+
+1. Build the extension (from project root): `npm run build`
+2. Open Chrome → `chrome://extensions`
+3. Turn on **Developer mode** → **Load unpacked**
+4. Select the `extension/dist` folder (not `extension` — Chrome needs the built .js files)
+5. The AccessPilot extension appears. Leave it enabled.
+
+Done. The extension connects to the agent automatically.
+
+---
+
 ## Use
 
-1. A small blue icon appears in the corner
-2. **Click** the icon to start recording — speak your command
-3. **Click again** to stop and run the command
-4. Examples: `open wikipedia`, `search scholarships`, `open Chrome`, `what time is it`
+1. **Click** the blue icon → speak
+2. **Click again** → agent runs your command
+3. Use Chrome for web (the extension runs there)
 
-## Commands
+**Examples**
 
 | Say | Does |
 |-----|------|
-| open wikipedia | Opens in browser |
-| open Chrome | Opens the app |
-| search for X | DuckDuckGo search |
-| what time is it | Speaks time |
-| what's the date | Speaks date |
-| stop | Stops / cancels |
+| Open Amazon and search for candles | Opens Amazon, then searches on it |
+| Open wikipedia | Opens Wikipedia |
+| Search for shoes | Searches on the current page |
+| Click the buy button | Clicks it |
+| What time is it | Speaks the time |
+| Scroll down | Scrolls the page |
 
-## Build
+---
+
+## Build for Distribution
 
 ```bash
 cd agent-app
 npm run tauri build
 ```
 
-Output in `src-tauri/target/release/bundle/`.
+Output: `src-tauri/target/release/bundle/`
+
+---
 
 ## Development
 
-HMR is disabled. After changing frontend code, fully restart the app (Ctrl+C, then `npm run tauri dev` again) for changes to take effect.
+HMR is disabled. Restart the app (Ctrl+C, then `npm run tauri dev`) after code changes.

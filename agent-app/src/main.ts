@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { requestPermission } from "tauri-plugin-stt-api";
 import AudioRecorder from "audio-recorder-polyfill";
 
@@ -12,6 +13,14 @@ function speak(text: string) {
     const u = new SpeechSynthesisUtterance(text);
     window.speechSynthesis.speak(u);
   }
+}
+
+function scheduleExtensionTimeout() {
+  if (extensionResultTimeoutId) clearTimeout(extensionResultTimeoutId);
+  extensionResultTimeoutId = setTimeout(() => {
+    extensionResultTimeoutId = null;
+    speak("Extension didn't respond. Start the agent first, refresh the tab, then try again.");
+  }, EXTENSION_TIMEOUT_MS);
 }
 
 /** Shorten errors for TTS (max ~80 chars). Don't mask — surface the real issue. */
@@ -30,10 +39,19 @@ async function parseCommand(text: string): Promise<{ type: string; payload: stri
 }
 
 function resolveUrl(payload: string): string {
-  const p = payload.trim();
-  if (/^https?:\/\//i.test(p)) return p;
+  const p = payload.trim().toLowerCase();
+  if (/^https?:\/\//i.test(p)) return payload.trim();
   if (/^[a-z0-9-]+\.[a-z]{2,}$/i.test(p)) return `https://${p}`;
-  return `https://duckduckgo.com/?q=${encodeURIComponent(p)}`;
+  const known: Record<string, string> = {
+    amazon: "https://www.amazon.com",
+    ebay: "https://www.ebay.com",
+    walmart: "https://www.walmart.com",
+    wikipedia: "https://www.wikipedia.org",
+    google: "https://www.google.com",
+    youtube: "https://www.youtube.com",
+  };
+  if (known[p]) return known[p];
+  return `https://www.${p}.com`;
 }
 
 async function runCommand(text: string) {
@@ -81,7 +99,60 @@ async function runCommand(text: string) {
     return;
   }
 
-  speak("I didn't understand. Try: open wikipedia, or search for something.");
+  // open_and_search: open site, wait for load, then search on it (one phrase does both)
+  if (parsed.type === "open_and_search") {
+    const parts = parsed.payload.split("|").map((s) => s.trim());
+    const site = parts[0] || "";
+    const query = parts.slice(1).join("|").trim();
+    if (!site || !query) {
+      speak("Try: open Amazon and search for candles.");
+      return;
+    }
+    const url = resolveUrl(site);
+    await invoke("open_url", { url });
+    speak("Opening. Searching in a moment.");
+    await new Promise((r) => setTimeout(r, 3500));
+    const extCmd = `search for ${query}`;
+    const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
+    if (!sent) speak("Install the AccessPilot extension for in-page search.");
+    else scheduleExtensionTimeout();
+    return;
+  }
+
+  // In-page actions: click, find, page_search, scroll, access_mode — send to extension
+  const extensionActions = ["click", "find", "page_search", "scroll", "access_mode"];
+  if (extensionActions.includes(parsed.type)) {
+    const extCmd = formatExtensionCommand(parsed.type, parsed.payload);
+    const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
+    if (!sent) {
+      speak("Install the AccessPilot Chrome extension and refresh your tab, then try again.");
+    } else {
+      scheduleExtensionTimeout();
+    }
+    return;
+  }
+
+  speak("I didn't understand. Try: open wikipedia, click the buy button, or search for something.");
+}
+
+function formatExtensionCommand(action: string, payload: string): string {
+  const p = payload.trim();
+  switch (action) {
+    case "click":
+      return `click ${p}`;
+    case "find":
+      return `find ${p}`;
+    case "page_search":
+      return `search for ${p}`;
+    case "scroll":
+      return ["up", "down", "top", "bottom"].includes(p.toLowerCase())
+        ? `scroll ${p.toLowerCase()}`
+        : `scroll ${p}`;
+    case "access_mode":
+      return p.toLowerCase() === "on" ? "one-hand mode on" : "one-hand mode off";
+    default:
+      return `${action} ${p}`;
+  }
 }
 
 let isListening = false;
@@ -200,6 +271,19 @@ async function startListening() {
 getCurrentWindow()
   .setFocus()
   .catch(() => {});
+
+// Timeout when extension doesn't respond (e.g. not connected or wrong tab)
+let extensionResultTimeoutId: ReturnType<typeof setTimeout> | null = null;
+const EXTENSION_TIMEOUT_MS = 5000;
+
+// Speak results from extension (click, find, search, etc.)
+listen<string>("extension-result", (e) => {
+  if (extensionResultTimeoutId) {
+    clearTimeout(extensionResultTimeoutId);
+    extensionResultTimeoutId = null;
+  }
+  if (e.payload) speak(e.payload);
+}).catch(() => {});
 
 icon.addEventListener("pointerdown", async (e) => {
   e.preventDefault();

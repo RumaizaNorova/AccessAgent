@@ -2,9 +2,13 @@ use base64::{
     engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig},
     Engine,
 };
+use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart;
 use std::process::Command;
-use tauri::Manager;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::tungstenite::Message;
 
 fn decode_base64_audio(s: &str) -> Result<Vec<u8>, String> {
     let engine = GeneralPurpose::new(
@@ -51,22 +55,33 @@ Return ONLY valid JSON (no markdown, no explanation): {"action": string, "payloa
 Actions and payloads:
 - open: Launch an app, open a URL, or go to a website. payload = app name, URL, or site (e.g. "chrome", "spotify", "wikipedia", "youtube.com", "amazon")
   Examples: "open chrome", "launch spotify", "go to wikipedia", "open up youtube", "start slack", "take me to google"
-- search: Look something up on the web. payload = search query
-  Examples: "search for restaurants nearby", "look up python tutorials", "find hotels in Paris", "google best headphones", "what is the capital of France", "how do I fix a flat tire"
+- search: Web search (opens search engine). Use ONLY when user says "google", "search the web", "look up on the internet", or asks a general knowledge question. payload = search query
+  Examples: "google best headphones", "search the web for restaurants", "look up python tutorials online", "what is the capital of France"
 - time: Get the current time. payload = ""
   Examples: "what time is it", "time", "current time", "what's the time"
 - date: Get today's date. payload = ""
   Examples: "what's the date", "date", "what day is it", "today's date"
 - stop: Cancel or stop. payload = ""
   Examples: "stop", "cancel", "never mind", "forget it"
+- click: Click a button, link, or element on the current webpage. payload = what to click (e.g. "buy button", "submit", "login", "continue", "next")
+  Examples: "click the buy button", "click submit", "click continue", "press next", "hit the login button"
+- find: Find and highlight text or element on the page (scroll to it). payload = what to find
+  Examples: "find login", "find the requirements", "scroll to contact", "show me the price"
+- page_search: Search box ON THE CURRENT PAGE (e.g. Amazon, any site). Use when user says "search for X", "look for X", "find X", or "on this page/search here/on the site I'm on" + search. payload = search query only (e.g. "candles")
+  Examples: "search for candles", "search for shoes", "on this page search for candles", "on the website I'm on search for candles", "see the page I'm at and search for X" → page_search with payload "X"
+- scroll: Scroll the page. payload = "up", "down", "top", or "bottom"
+  Examples: "scroll down", "scroll up", "go to top", "scroll to bottom"
+- access_mode: Toggle one-hand / target boost mode. payload = "on" or "off"
+  Examples: "access mode on", "target boost off"
+- open_and_search: Open a website THEN search on it. payload = "site|query" (e.g. "amazon|candles", "wikipedia|Albert Einstein"). Site can be "amazon", "amazon.com", "wikipedia", etc.
+  Examples: "open Amazon and search for candles", "go to Amazon and look for shoes", "open Wikipedia and search for Einstein", "take me to eBay and search for headphones"
 
 Rules:
-- Understand synonyms: "launch", "go to", "open up", "start", "take me to" → open. "look up", "find", "google", "search for" → search.
-- For questions like "what is X" or "how do I X" → search with the full question as payload.
-- Be generous with understanding: "play some music" → open spotify. "check my email" → open mail.
-- If the user names a website (e.g. "reddit", "github") → open with that as payload.
-- If truly ambiguous, prefer "search" with full input as payload.
-- Preserve the user's exact words in payload when relevant (e.g. search query)."#;
+- open vs click: open = navigate to new URL or launch app. click = interact with element on current page.
+- search vs page_search: DEFAULT to page_search for "search for X" — user is usually on a site. Use search (web) only when they say "google", "on the web", or ask a knowledge question.
+- open_and_search: Use when user says "open X and search for Y" or "go to X and look for Y" — one command does both.
+- Understand synonyms: "launch", "go to" → open. "press", "hit" → click. "find", "show me", "scroll to" → find.
+- Preserve the user's exact words in payload when relevant."#;
 
     let client = reqwest::Client::new();
     let res = client
@@ -102,8 +117,10 @@ Rules:
 
     let intent: ParsedIntent = serde_json::from_str(content).map_err(|e| format!("Parse error: {}", e))?;
 
-    // Validate action
-    let valid = ["open", "search", "time", "date", "stop"];
+    // Validate action (agent handles some, extension handles in-page)
+    let agent_actions = ["open", "search", "time", "date", "stop"];
+    let extension_actions = ["click", "find", "page_search", "scroll", "access_mode", "open_and_search"];
+    let valid: Vec<&str> = agent_actions.iter().chain(extension_actions.iter()).copied().collect();
     if !valid.contains(&intent.action.as_str()) {
         return Ok(ParsedIntent {
             action: "search".to_string(),
@@ -211,7 +228,11 @@ async fn send_audio_to_whisper(
 async fn open_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(&url).spawn().map_err(|e| e.to_string())?;
+        // Open in Chrome so the extension can run (search, click, find on page)
+        Command::new("open")
+            .args(["-a", "Google Chrome", &url])
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -234,6 +255,28 @@ async fn open_app(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Send command to extension via WebSocket bridge. Returns true if sent, false if no extension connected.
+#[tauri::command]
+async fn send_to_extension(command: String, app: tauri::AppHandle) -> Result<bool, String> {
+    let state = app.state::<ExtensionBridge>();
+    let tx = state.tx.lock().await;
+    if let Some(sender) = tx.as_ref() {
+        sender
+            .send(command)
+            .await
+            .map_err(|e| format!("Bridge send error: {}", e))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+struct ExtensionBridge {
+    tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>,
+}
+
+const WS_PORT: u16 = 8765;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Load .env from agent-app/ — use _override so .env wins over any stale shell env var
@@ -243,16 +286,88 @@ pub fn run() {
             let _ = dotenvy::from_path_override(&env_path);
         }
     }
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>(32);
+    let bridge = ExtensionBridge {
+        tx: Arc::new(tokio::sync::Mutex::new(Some(cmd_tx))),
+    };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_stt::init())
+        .manage(bridge)
+        .setup(move |app| {
+            let app_handle = app.handle().clone();
+            let mut cmd_rx = cmd_rx;
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = run_ws_bridge(&app_handle, &mut cmd_rx).await {
+                    eprintln!("[bridge] ws server error: {}", e);
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             parse_intent,
             whisper_available,
             transcribe_audio,
             open_url,
-            open_app
+            open_app,
+            send_to_extension
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+type WsWriter = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    Message,
+>;
+
+async fn run_ws_bridge(
+    app: &tauri::AppHandle,
+    cmd_rx: &mut mpsc::Receiver<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+
+    let listener = TcpListener::bind(("127.0.0.1", WS_PORT)).await?;
+    eprintln!("[bridge] WebSocket server on ws://127.0.0.1:{}", WS_PORT);
+
+    let clients: Arc<Mutex<Vec<WsWriter>>> = Arc::new(Mutex::new(Vec::new()));
+    let clients_send = Arc::clone(&clients);
+
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                if let Some(c) = cmd {
+                    let msg = Message::Text(c);
+                    let mut cl = clients_send.lock().await;
+                    let mut ok = Vec::new();
+                    for mut sender in std::mem::take(&mut *cl) {
+                        if sender.send(msg.clone()).await.is_ok() {
+                            ok.push(sender);
+                        }
+                    }
+                    *cl = ok;
+                }
+            }
+            Ok((stream, _)) = listener.accept() => {
+                if let Ok(ws) = accept_async(stream).await {
+                    let (write, mut read) = ws.split();
+                    clients_send.lock().await.push(write);
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        while let Some(Ok(msg)) = read.next().await {
+                            if let Message::Text(text) = msg {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    let m = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
+                                    let _ = app.emit("extension-result", m);
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
 }
