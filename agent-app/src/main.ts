@@ -89,21 +89,22 @@ let isListening = false;
 let isStarting = false;
 let lastProcessed = "";
 
-// Whisper path: MediaRecorder for accurate transcription when API key is set
+// Whisper path: MediaRecorder for accurate transcription
 let mediaRecorder: MediaRecorder | null = null;
 let audioChunks: Blob[] = [];
 let whisperMimeType = "audio/webm";
 
-/** Use polyfill when native would use mp4 (Safari/WebKit) — mp4 has encoding/corruption issues */
+/** Use polyfill when native would use mp4 (Safari/WebKit) — mp4 has encoding issues in WebKit */
 function getMediaRecorderConstructor(): typeof MediaRecorder {
   const prefersMp4 = MediaRecorder.isTypeSupported("audio/mp4") && !MediaRecorder.isTypeSupported("audio/webm");
   return prefersMp4 ? (AudioRecorder as unknown as typeof MediaRecorder) : MediaRecorder;
 }
 
+const CHUNK_INTERVAL_MS = 100; // Request chunks during recording so we capture short utterances and don't rely on final flush
+
 async function startListeningWhisper() {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const Recorder = getMediaRecorderConstructor();
-  // Polyfill outputs WAV (reliable). Native Chrome uses webm. Safari native uses mp4 (problematic).
   const mimeType = Recorder === AudioRecorder
     ? "audio/wav"
     : MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
@@ -112,45 +113,50 @@ async function startListeningWhisper() {
   const recorder = new Recorder(stream, Recorder === MediaRecorder ? { mimeType } : undefined);
   whisperMimeType = Recorder === AudioRecorder ? "audio/wav" : mimeType;
   audioChunks = [];
-  recorder.ondataavailable = (e: BlobEvent) => {
+  const onData = (e: BlobEvent) => {
     if (e.data.size > 0) audioChunks.push(e.data);
   };
-  recorder.start();
+  recorder.addEventListener("dataavailable", onData);
+  recorder.start(CHUNK_INTERVAL_MS); // Timeslice = get chunks during recording, not just at stop
   mediaRecorder = recorder as MediaRecorder;
 }
 
 const AUDIO_TEMP_FILE = "accesspilot_audio_temp";
 
-function stopListeningWhisper(): Promise<{ filename: string; mimeType: string } | null> {
-  return new Promise((resolve) => {
+type StopResult = { filename: string; mimeType: string } | { error: string };
+
+function stopListeningWhisper(): Promise<StopResult | null> {
+  return new Promise((resolve, reject) => {
     const recorder = mediaRecorder;
     mediaRecorder = null;
     if (!recorder || recorder.state === "inactive") {
       resolve(null);
       return;
     }
-    recorder.onstop = async () => {
-      recorder.stream.getTracks().forEach((t) => t.stop());
-      // Defer so ondataavailable has a chance to run (some impls fire it after stop)
-      await new Promise((r) => setTimeout(r, 50));
-      const chunks = [...audioChunks];
+    const handleStop = async () => {
+      recorder.stream?.getTracks?.()?.forEach((t) => t.stop());
+      // Polyfill encoder is async; native may need a tick. Wait for final data.
+      await new Promise((r) => setTimeout(r, 150));
+      const chunks = audioChunks.filter((c) => c.size > 0);
       if (chunks.length === 0) {
-        resolve(null);
+        resolve({ error: "Microphone didn't capture any audio." });
         return;
       }
-      const bestChunk = chunks.reduce((a, b) => (a.size >= b.size ? a : b));
-      const blob = chunks.length === 1 ? bestChunk : new Blob([bestChunk], { type: whisperMimeType });
+      // Merge ALL chunks — previous code used only the largest, losing audio
+      const blob = new Blob(chunks, { type: whisperMimeType });
       const ext = whisperMimeType === "audio/wav" ? "wav" : "webm";
       try {
         const bytes = new Uint8Array(await blob.arrayBuffer());
         const filename = `${AUDIO_TEMP_FILE}.${ext}`;
-        await writeFile(filename, bytes, { baseDir: BaseDirectory.Cache });
+        await writeFile(filename, bytes, { baseDir: BaseDirectory.AppCache });
         resolve({ filename, mimeType: whisperMimeType });
       } catch (e) {
-        console.error("[whisper] write file error:", e);
-        resolve(null);
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error("[whisper] write file error:", msg);
+        reject(new Error(`Could not save audio: ${msg}`));
       }
     };
+    recorder.addEventListener("stop", handleStop, { once: true });
     recorder.requestData?.();
     recorder.stop();
   });
@@ -203,8 +209,9 @@ icon.addEventListener("pointerdown", async (e) => {
     speak("Transcribing.");
     try {
       const result = await stopListeningWhisper();
-      if (!result) {
-        speak("No audio recorded.");
+      if (!result) return;
+      if ("error" in result) {
+        speak(result.error);
         return;
       }
       const txt = await invoke<string>("transcribe_audio_file", {
@@ -221,8 +228,8 @@ icon.addEventListener("pointerdown", async (e) => {
           speak(shortenForTts(msg));
         }
         setTimeout(() => { lastProcessed = ""; }, 2000);
-      } else if (!txt) {
-        speak("No speech detected.");
+      } else if (!txt || !txt.trim()) {
+        speak("No speech detected. Try speaking again.");
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

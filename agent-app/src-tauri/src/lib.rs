@@ -1,17 +1,3 @@
-use base64::{
-    engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig},
-    Engine,
-};
-
-fn decode_base64_audio(s: &str) -> Result<Vec<u8>, String> {
-    let engine = GeneralPurpose::new(
-        &base64::alphabet::STANDARD,
-        GeneralPurposeConfig::new()
-            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent)
-            .with_decode_allow_trailing_bits(true),
-    );
-    engine.decode(s).map_err(|e| format!("Invalid base64: {}", e))
-}
 use reqwest::multipart;
 use std::process::Command;
 use tauri::Manager;
@@ -143,7 +129,7 @@ async fn transcribe_audio_file(
 ) -> Result<String, String> {
     let cache_dir = app
         .path()
-        .cache_dir()
+        .app_cache_dir()
         .map_err(|e| format!("Cache dir: {}", e))?;
     let path = cache_dir.join(&filename);
 
@@ -153,41 +139,6 @@ async fn transcribe_audio_file(
         msg
     })?;
     let _ = std::fs::remove_file(&path);
-
-    send_audio_to_whisper(&audio_bytes, mime_type.as_deref()).await
-}
-
-/// Transcribe audio using OpenAI Whisper API. Accepts base64-encoded audio.
-#[tauri::command]
-async fn transcribe_audio(base64_audio: String, mime_type: Option<String>) -> Result<String, String> {
-    eprintln!("[transcribe] input len={}, mime={:?}", base64_audio.len(), mime_type);
-
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| {
-            let msg = "No API key. Set OPENAI_API_KEY env var.";
-            eprintln!("[transcribe] {}", msg);
-            msg.to_string()
-        })?
-        .trim()
-        .to_string();
-    if api_key.is_empty() {
-        return Err("No API key. Set OPENAI_API_KEY env var.".into());
-    }
-
-    // Trim whitespace only - frontend sends clean base64 from btoa()
-    let base64_trimmed = base64_audio.trim().replace('\r', "").replace('\n', "");
-    eprintln!(
-        "[transcribe] input len={}, trimmed len={}, head={:?}",
-        base64_audio.len(),
-        base64_trimmed.len(),
-        base64_trimmed.chars().take(80).collect::<String>()
-    );
-
-    let audio_bytes = decode_base64_audio(&base64_trimmed).map_err(|e| {
-        eprintln!("[transcribe] base64 error: {}", e);
-        e.to_string()
-    })?;
-    eprintln!("[transcribe] decoded {} bytes", audio_bytes.len());
 
     send_audio_to_whisper(&audio_bytes, mime_type.as_deref()).await
 }
@@ -298,7 +249,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             parse_intent,
             whisper_available,
-            transcribe_audio,
             transcribe_audio_file,
             open_url,
             open_app
