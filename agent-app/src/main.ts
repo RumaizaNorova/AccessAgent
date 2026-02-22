@@ -6,6 +6,14 @@ import AudioRecorder from "audio-recorder-polyfill";
 
 const icon = document.getElementById("icon")!;
 const agentWrap = document.getElementById("agent-wrap")!;
+const modePicker = document.getElementById("mode-picker")!;
+const agentMain = document.getElementById("agent-main")!;
+const modeVoiceBtn = document.getElementById("mode-voice")!;
+const modeGazeBtn = document.getElementById("mode-gaze")!;
+const switchModeBtn = document.getElementById("switch-mode")!;
+
+const STORAGE_KEY = "accesspilot_input_mode";
+type InputMode = "voice" | "gaze";
 
 function speak(text: string) {
   if (!text) return;
@@ -34,10 +42,11 @@ function shortenForTts(msg: string): string {
 type Step = { action: string; payload: string; target_type?: string };
 type ParsedIntent = { steps: Step[]; chat_reply?: string | null };
 
-async function parseCommand(text: string): Promise<ParsedIntent> {
+async function parseCommand(text: string, frontmostApp: string | null): Promise<ParsedIntent> {
   const intent = await invoke<ParsedIntent>("parse_intent", {
     command: text,
     apiKeyOverride: null,
+    frontmostApp: frontmostApp ?? null,
   });
   return {
     steps: intent.steps || [],
@@ -109,7 +118,7 @@ function resolveNativeAppName(payload: string): string {
 const PAGE_LOAD_DELAY_MS = 3500;
 const extensionActions = ["click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "go_to_page", "access_mode", "close_popup", "go_to", "type"];
 
-async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "done"> {
+async function executeStep(step: Step, isChromeFocused: boolean): Promise<"opened_url" | "sent_to_ext" | "done"> {
   const { action: type, payload: p, target_type } = step;
 
   if (type === "time") {
@@ -130,6 +139,10 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
     const payload = p.trim();
     const looksLikeInPage = /\b(first|second|third|this|that)\s*(one|video|result|item)?\b/i.test(payload) || /\bvideo\b/i.test(payload);
     if (looksLikeInPage) {
+      if (!isChromeFocused) {
+        speak("I need Chrome focused for that. Switch to Chrome, then say it again.");
+        return "sent_to_ext";
+      }
       const sent = await invoke<boolean>("send_to_extension", { command: `click ${payload}` });
       if (!sent) speak("Chrome extension not connected. Open Chrome, load AccessPilot from chrome://extensions, open a webpage, then try again.");
       else {
@@ -223,6 +236,10 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
     return "done";
   }
   if (extensionActions.includes(type)) {
+    if (!isChromeFocused) {
+      speak("I need Chrome focused for that. Switch to Chrome, then say it again.");
+      return "done";
+    }
     const extCmd = formatExtensionCommand(type, p);
     const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
     if (!sent) speak("Chrome extension not connected. Open Chrome, load AccessPilot from chrome://extensions, open a webpage, then try again.");
@@ -246,7 +263,10 @@ function normalizeKeyCombo(p: string): string {
 }
 
 async function runCommand(text: string) {
-  const { steps, chat_reply } = await parseCommand(text);
+  const frontmostApp = await invoke<string | null>("get_frontmost_app");
+  const isChromeFocused = frontmostApp?.toLowerCase().includes("chrome") ?? false;
+
+  const { steps, chat_reply } = await parseCommand(text, frontmostApp);
 
   // Conversational intent: speak reply and return (no steps to execute)
   if (chat_reply?.trim()) {
@@ -266,7 +286,7 @@ async function runCommand(text: string) {
       await new Promise((r) => setTimeout(r, PAGE_LOAD_DELAY_MS));
       justOpenedUrl = false;
     }
-    const result = await executeStep(step);
+    const result = await executeStep(step, isChromeFocused);
     justOpenedUrl = result === "opened_url";
   }
 }
@@ -490,20 +510,19 @@ getCurrentWindow()
 // Store app that had focus before we stole it (so press_keys goes there, not to us)
 let lastFocusedAppBundleId: string | null = null;
 
-// Global hotkey: Option+Space — summon agent and start listening from anywhere
+// Global hotkey: Option+Space — summon agent and start listening from anywhere (voice mode only)
 import("@tauri-apps/plugin-global-shortcut")
   .then(({ register }) =>
     register("Alt+Space", async (event) => {
-      // Ignore release — shortcut fires on press AND release; release was stopping recording
       if (event.state !== "Pressed") return;
-      // Capture frontmost app so press_keys goes there, not to us. Don't steal focus.
+      if (getStoredMode() === "gaze") return;
       try {
         const bundleId = await invoke<string | null>("get_frontmost_app");
         if (bundleId && !bundleId.toLowerCase().includes("accesspilot")) {
           lastFocusedAppBundleId = bundleId;
         }
       } catch {
-        // ignore
+        /* ignore */
       }
       startListening();
     })
@@ -544,8 +563,91 @@ listen<string>("extension-result", async (e) => {
   if (payload) speak(payload);
 }).catch(() => {});
 
+function getStoredMode(): InputMode | null {
+  try {
+    const m = localStorage.getItem(STORAGE_KEY);
+    if (m === "voice" || m === "gaze") return m;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function setStoredMode(mode: InputMode) {
+  localStorage.setItem(STORAGE_KEY, mode);
+}
+
+async function notifyExtensionMode(mode: InputMode) {
+  try {
+    await invoke<boolean>("send_to_extension", { command: `INPUT_MODE:${mode}` });
+  } catch {
+    // Extension may not be connected
+  }
+}
+
+function applyMode(mode: InputMode) {
+  setStoredMode(mode);
+  notifyExtensionMode(mode);
+  agentWrap.classList.remove("voice-mode", "gaze-mode");
+  agentWrap.classList.add(`${mode}-mode`);
+
+  if (mode === "voice") {
+    agentMain.querySelector("#icon")!.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="currentColor" width="40" height="40">
+        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V20c0 .55.45 1 1 1s1-.45 1-1v-2.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/>
+      </svg>`;
+    speak("Voice mode. Tap or press Option+Space to talk.");
+  } else {
+    agentMain.querySelector("#icon")!.innerHTML = `
+      <svg viewBox="0 0 24 24" fill="currentColor" width="40" height="40">
+        <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
+      </svg>`;
+    speak("Gaze mode. Look at items on web pages to click. Switch to Chrome and allow the extension.");
+  }
+}
+
+function showModePicker() {
+  modePicker.classList.remove("hidden");
+  agentMain.classList.add("hidden");
+  agentMain.style.display = "none";
+}
+
+function showAgentMain(mode: InputMode) {
+  modePicker.classList.add("hidden");
+  agentMain.classList.remove("hidden");
+  agentMain.style.display = "flex";
+  applyMode(mode);
+}
+
+function initMode() {
+  const saved = getStoredMode();
+  if (saved) {
+    showAgentMain(saved);
+  } else {
+    showModePicker();
+  }
+}
+
+modeVoiceBtn.addEventListener("click", () => {
+  showAgentMain("voice");
+});
+
+modeGazeBtn.addEventListener("click", () => {
+  showAgentMain("gaze");
+});
+
+switchModeBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  showModePicker();
+});
+
 async function handleMicAction() {
   if (isStarting) return;
+  const mode = getStoredMode();
+  if (mode === "gaze") {
+    speak("Gaze mode is on. Open a webpage in Chrome and look at items to click.");
+    return;
+  }
   if (isListening) {
     await processAndRun();
     return;
@@ -553,15 +655,19 @@ async function handleMicAction() {
   await startListening();
 }
 
-// Whole window is one big tap target — click/tap anywhere
+// Whole window tap — voice mode only does mic
 agentWrap.addEventListener("pointerdown", (e) => {
   e.preventDefault();
   e.stopPropagation();
-  handleMicAction();
+  if (modePicker.classList.contains("hidden")) {
+    handleMicAction();
+  }
 });
-// Also on icon for redundancy
+
 icon.addEventListener("pointerdown", (e) => {
   e.preventDefault();
   e.stopPropagation();
   handleMicAction();
 });
+
+initMode();

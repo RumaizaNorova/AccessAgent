@@ -1,6 +1,6 @@
 # AccessPilot Agent
 
-A voice-controlled desktop agent for accessibility. Small floating icon — click to talk, speak your command, click again. Uses OpenAI Whisper + GPT-4o.
+A voice- and gaze-controlled desktop agent for accessibility. Choose **Voice** (speak commands) or **Gaze** (look at items to click). Uses OpenAI Whisper + GPT-4o.
 
 ---
 
@@ -47,10 +47,11 @@ Done. The extension connects to the agent automatically.
 
 ## Use
 
-1. **Option+Space** — Global hotkey to summon agent and start listening (from any app)
-2. **Click** the blue icon → speak
-3. **Click again** → agent runs your command
-4. Use Chrome for web (the extension runs there)
+1. **First launch** — Choose **Voice** or **Gaze**
+2. **Voice mode**: Option+Space or click the mic icon → speak → click again to run
+3. **Gaze mode**: Look at items on web pages; dwell ~2 seconds to click (uses webcam)
+4. **Switch** — Click "Switch" to change input mode
+5. Chrome extension required for web actions (search, find, click)
 
 **Examples**
 
@@ -66,6 +67,8 @@ Done. The extension connects to the agent automatically.
 | Scroll down | Scrolls the page |
 
 **Press keys:** Commands like "press Command S", "save", "press Enter" simulate keystrokes. Requires **Accessibility** permission. Use `npm run tauri:dev:ax` instead of `npm run tauri dev` (add AccessPilot-debug.app to Accessibility first; run `./scripts/make-debug-app.sh` once after first build).
+
+**Gaze mode:** Uses your webcam to track where you look. Look at a button/link for ~2 seconds to click it. Best on well-lit pages. Click a few spots to calibrate. You can also set input mode in the Chrome extension popup.
 
 ---
 

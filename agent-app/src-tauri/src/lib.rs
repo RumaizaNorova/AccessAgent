@@ -73,8 +73,8 @@ fn is_likely_conversation(s: &str) -> bool {
     }
     let normalized = normalize_for_check(t);
     let lower = t.to_lowercase();
-    // Must NOT contain command verbs — "search for hey" is a command
-    let has_command_verb = ["open ", "search ", "search for", "click ", "find ", "find and ", "scroll ", "go to ", "go to the ", "close the ", "close slack", "open gmail", "open amazon"].iter().any(|v| lower.contains(v));
+    // Must NOT contain command verbs — "search for hey" or "write how are you in here" is a command
+    let has_command_verb = ["open ", "search ", "search for", "click ", "find ", "find and ", "scroll ", "go to ", "go to the ", "close the ", "close slack", "open gmail", "open amazon", "write ", "type "].iter().any(|v| lower.contains(v));
     if has_command_verb {
         return false;
     }
@@ -119,10 +119,45 @@ fn is_likely_conversation(s: &str) -> bool {
     false
 }
 
+/// Bundle ID → human-readable name for context. Helps GPT understand "user is in Notion".
+fn frontmost_app_display(bundle_id: Option<&str>) -> String {
+    let bid = match bundle_id {
+        Some(b) if !b.is_empty() => b.to_lowercase(),
+        _ => return "unknown".to_string(),
+    };
+    if bid.contains("chrome") || bid.contains("chromium") {
+        "Chrome"
+    } else if bid.contains("notion") {
+        "Notion"
+    } else if bid.contains("slack") {
+        "Slack"
+    } else if bid.contains("mail") && !bid.contains("gmail") {
+        "Mail"
+    } else if bid.contains("messages") {
+        "Messages"
+    } else if bid.contains("notes") {
+        "Notes"
+    } else if bid.contains("safari") {
+        "Safari"
+    } else if bid.contains("firefox") {
+        "Firefox"
+    } else if bid.contains("code") || bid.contains("cursor") {
+        "Editor"
+    } else if bid.contains("outlook") {
+        "Outlook"
+    } else if bid.contains("finder") {
+        "Finder"
+    } else {
+        "other app"
+    }
+    .to_string()
+}
+
 #[tauri::command]
 async fn parse_intent(
     command: String,
     api_key_override: Option<String>,
+    frontmost_app: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<ParsedIntent, String> {
     let trimmed = command.trim();
@@ -164,6 +199,8 @@ async fn parse_intent(
         String::new()
     };
 
+    let frontmost_display = frontmost_app_display(frontmost_app.as_deref());
+
     let system_prompt = r#"You are a friendly assistant. Users talk to you OR give commands. You MUST decide which.
 
 CRITICAL: CONVERSATION vs COMMAND
@@ -191,15 +228,21 @@ Slack, Mail, Notes, Messages, Finder, Terminal, System Settings, Calendar, Remin
 Mappings: "email" or "mail"→Mail, "messages" or "imessage"→Messages, "notes"→Notes, "finder"→Finder, "settings" or "system preferences"→System Settings.
 Web-only (target_type null): Gmail, Amazon, Wikipedia, YouTube, Google, etc. — open in browser.
 
-TYPE: "type hello", "type john at gmail dot com" = type payload into focused text field. Voice substitutions: "at"→@, "dot"→. Preserve literal text. No Enter/submit unless user says "and submit".
+TYPE: "type hello", "write how are you", "type john at gmail dot com" = type payload into focused text field. "write X in here" / "type X here" = type X. Voice substitutions: "at"→@, "dot"→. Preserve literal text. No Enter/submit unless user says "and submit".
 KEYBOARD: "save"→press_keys Command+S, "close [app]"→Command+Q, "close dialog"→close_popup or Escape.
-PAGE CONTEXT (when URL given): youtube.com→click "first video" not logo; wikipedia→find_and_read; on-page locate=find/find_and_read; web search=search. Ambiguous→on-page."#;
+CONTEXT: User's frontmost app (what they're looking at) and Chrome tab URL. "in here" = the app they're focused on. If frontmost is Chrome → type/search/click apply to the Chrome tab. If frontmost is Notion/Slack/Mail/etc → user wants to type there; we can only type in Chrome for now—output type anyway.
+PAGE CONTEXT (when URL given): youtube.com→click "first video" not logo; wikipedia→find_and_read; on-page locate=find/find_and_read; web search=search. NEVER use page_search for conversational text like "how are you" when user said "write X in here"—that's type, not search. Ambiguous→on-page."#;
 
-    // Put user message FIRST so intent isn't buried by page context
-    let user_content = if page_context.is_empty() {
-        command.clone()
-    } else {
-        format!("User: {}\n(Current page: {})", command, page_context)
+    // Put user message first; add context so GPT knows what the user is looking at
+    let user_content = {
+        let mut ctx = String::new();
+        ctx.push_str(&format!("Frontmost app: {}. ", frontmost_display));
+        if !page_context.is_empty() {
+            ctx.push_str(&format!("Chrome tab: {}", page_context));
+        } else {
+            ctx.push_str("No Chrome tab.");
+        }
+        format!("User: {}\n({})", command, ctx.trim())
     };
 
     let messages: Vec<serde_json::Value> = vec![
@@ -240,6 +283,8 @@ PAGE CONTEXT (when URL given): youtube.com→click "first video" not logo; wikip
         serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"type","payload":"hello","target_type":null}]}"#}),
         serde_json::json!({"role": "user", "content": "type john at gmail dot com"}),
         serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"type","payload":"john at gmail dot com","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "User: write how are you in here\n(Frontmost app: Notion. Chrome tab: https://google.com)"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"type","payload":"how are you","target_type":null}]}"#}),
         serde_json::json!({"role": "user", "content": user_content}),
     ];
 
@@ -910,7 +955,7 @@ async fn handle_parse_and_run(
     command: &str,
     clients: &Arc<tokio::sync::Mutex<Vec<WsWriter>>>,
 ) {
-    let intent = match parse_intent(command.to_string(), None, app.clone()).await {
+    let intent = match parse_intent(command.to_string(), None, None, app.clone()).await {
         Ok(i) => i,
         Err(e) => {
             let _ = app.emit("extension-result", format!("Parse error: {}", e));

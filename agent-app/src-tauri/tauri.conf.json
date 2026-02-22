@@ -15,10 +15,10 @@
       {
         "label": "main",
         "title": "AccessPilot",
-        "width": 88,
-        "height": 88,
-        "minWidth": 72,
-        "minHeight": 72,
+        "width": 280,
+        "height": 180,
+        "minWidth": 120,
+        "minHeight": 100,
         "resizable": true,
         "decorations": false,
         "alwaysOnTop": true
