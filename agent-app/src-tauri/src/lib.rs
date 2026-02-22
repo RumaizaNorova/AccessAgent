@@ -57,32 +57,37 @@ async fn parse_intent(command: String, api_key_override: Option<String>) -> Resu
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .ok_or("No API key. Set OPENAI_API_KEY env var or add your key in Settings.")?;
 
-    let system_prompt = r#"You are an intelligent assistant that turns natural speech into executable plans. The user speaks freely—understand intent and break compound requests into steps.
+    let system_prompt = r#"You are an intelligent assistant that turns natural speech into executable plans for users with motor conditions (e.g. Parkinson's) who cannot use mouse/keyboard freely. Understand INTENT and MEANING—do not match keywords. People phrase things differently; infer what they want. The agent supports synonym-aware finding (price=cost, deadline=due date, etc.).
 
 Return ONLY valid JSON (no markdown, no explanation):
 {"steps": [{"action": string, "payload": string, "target_type": "website"|"native_app"|null}, ...]}
 
-AVAILABLE ACTIONS (use whichever fit the intent):
-- open: Go to a website or launch app. payload = site name (youtube, wikipedia, amazon...). target_type: "website" (default) or "native_app" for desktop apps only.
-- search: Web search (DuckDuckGo). payload = query
+ACTIONS (map to the intent, any wording):
+- open: Navigate to a site or app. payload = canonical name. target_type: "website" or "native_app".
+- search: Open a search engine and query the web. ONLY when intent is "search the internet" or "look something up online". NOT when locating info on the current page.
 - time, date, stop: payload = ""
-- click: Click/play/select on the CURRENT PAGE. payload = what to click (preserve ordinals: first video, second result)
-- find: Find and highlight text on page. payload = phrase to find
-- find_and_read: Find text, scroll to it, read it aloud. payload = what to find (e.g. "price", "requirements", "deadline")
-- page_search: Type into search box ON the current page. payload = query
-- scroll: payload = "up"|"down"|"top"|"bottom" or "down:3pages"
-- go_to: Scroll to a section by meaning. payload = their phrase (e.g. "his education", "pricing")
-- access_mode: payload = "on"|"off"
-- close_popup: payload = ""
-- open_and_search: Open site THEN search on it. payload = "site|query"
+- click: Interact with something on the current page (button, link, item). payload = what to click. Synonyms supported: "continue"="next", "sign in"="login", etc.
+- find: Locate and highlight text on the page. payload = concept or phrase (eligibility, price, deadline, shipping, requirements—synonyms work).
+- find_and_read: Locate text, scroll TO it, read it. Use when user wants to FIND and scroll to specific content. payload = what to locate.
+- find_next, find_prev: Cycle through multiple find results. "next match", "previous result", "next one", "go to next" → find_next. "previous match", "go back" (in find context) → find_prev. payload = "".
+- page_search: Type into the search box on the current page. payload = query.
+- scroll: ONLY for generic page motion—"scroll down", "scroll up", "scroll to top". When user wants to scroll TO something → use find_and_read or go_to.
+- go_to: Navigate to a section by meaning. payload = section topic (shipping, eligibility, contact, etc.).
+- access_mode, close_popup, open_and_search: as needed.
 
-CRITICAL—PLANNING:
-- "Find info on Wikipedia about X and scroll to it" → steps: [open wikipedia] → [page_search X] → [find_and_read X]
-- "Open Amazon, search for shoes, click the first one" → steps: [open amazon] → [page_search shoes] → [click first result]
-- "Scroll down and show me the price" → steps: [scroll down] → [find_and_read price]
-- Single requests = one step. Compound requests = multiple steps in logical order.
-- Infer context: "search for it" on a product page = page_search. "search the web" = search.
-- Understand synonyms: "look up", "find", "get info on", "go to section" — map to the right action."#;
+CRITICAL—UNDERSTAND CONTEXT:
+1. ON-PAGE = user wants to locate/retrieve/view something on the document. Intent: "where is X", "what does it say about X", "scroll so I can see X", "find X".
+   → find, find_and_read, go_to. Extract the CONCEPT: "cost" not "the thing about money".
+
+2. "Find X and scroll to it" / "scroll down to the X" = find_and_read X. NEVER bare scroll for targeted scrolling.
+
+3. WEB SEARCH = only when explicitly "search the web". Default to on-page when ambiguous.
+
+4. Extract concrete payloads: "eligibility", "deadline", "price", "shipping", "his parents"—never "information" or "the thing". Use the core concept; the system expands synonyms.
+
+5. "Next match", "next result", "show me the next one" (after a find) = find_next. "Previous", "go back" (in find context) = find_prev.
+
+PLANNING: Compound = multiple steps. Single = one step."#;
 
     let client = reqwest::Client::new();
     let res = client
@@ -148,7 +153,7 @@ CRITICAL—PLANNING:
         });
     };
 
-    let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
+    let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
     steps.retain(|s| valid.contains(&s.action.as_str()));
     if steps.is_empty() {
         steps = vec![Step {
@@ -338,6 +343,45 @@ async fn open_app(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Format a step for the extension (matches main.ts formatExtensionCommand).
+fn format_step_for_extension(step: &Step) -> Option<String> {
+    let action = step.action.to_lowercase();
+    let payload = step.payload.trim();
+    let cmd = match action.as_str() {
+        "open" => format!("open {payload}"),
+        "search" => format!("search for {payload}"),
+        "click" => format!("click {payload}"),
+        "find" => format!("find {payload}"),
+        "find_and_read" => format!("find_and_read {payload}"),
+        "find_next" => "find next match".into(),
+        "find_prev" => "find prev match".into(),
+        "page_search" => format!("search for {payload}"),
+        "scroll" => format!("scroll {}", payload.to_lowercase()),
+        "access_mode" => {
+            if payload.to_lowercase() == "on" {
+                "one-hand mode on".into()
+            } else {
+                "one-hand mode off".into()
+            }
+        }
+        "close_popup" => "close popup".into(),
+        "go_to" => format!("get_headings:{payload}"),
+        _ => return None,
+    };
+    Some(cmd)
+}
+
+/// Steps that the extension can execute (open, search navigate from content script).
+const EXTENSION_EXECUTABLE: &[&str] = &[
+    "open", "search", "click", "find", "find_and_read", "find_next", "find_prev",
+    "page_search", "scroll", "access_mode", "close_popup", "go_to",
+];
+
+type WsWriter = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    tokio_tungstenite::tungstenite::Message,
+>;
+
 /// Send command to extension via WebSocket bridge. Returns true if sent to at least one connected extension.
 #[tauri::command]
 async fn send_to_extension(command: String, app: tauri::AppHandle) -> Result<bool, String> {
@@ -409,10 +453,45 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-type WsWriter = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    Message,
->;
+const PAGE_LOAD_DELAY_SECS: u64 = 3;
+
+async fn handle_parse_and_run(
+    app: &tauri::AppHandle,
+    command: &str,
+    clients: &Arc<tokio::sync::Mutex<Vec<WsWriter>>>,
+) {
+    let intent = match parse_intent(command.to_string(), None).await {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = app.emit("extension-result", format!("Parse error: {}", e));
+            return;
+        }
+    };
+    let mut just_opened_url = false;
+    for step in &intent.steps {
+        let action = step.action.to_lowercase();
+        if just_opened_url && EXTENSION_EXECUTABLE.iter().any(|a| *a == action) {
+            tokio::time::sleep(std::time::Duration::from_secs(PAGE_LOAD_DELAY_SECS)).await;
+            just_opened_url = false;
+        }
+        if !EXTENSION_EXECUTABLE.iter().any(|a| *a == action) {
+            continue;
+        }
+        let Some(cmd) = format_step_for_extension(step) else { continue };
+        if step.action.to_lowercase() == "open" || step.action.to_lowercase() == "search" {
+            just_opened_url = true;
+        }
+        let msg = tokio_tungstenite::tungstenite::Message::Text(cmd);
+        let mut cl = clients.lock().await;
+        let mut ok = Vec::new();
+        for mut sender in std::mem::take(&mut *cl) {
+            if sender.send(msg.clone()).await.is_ok() {
+                ok.push(sender);
+            }
+        }
+        *cl = ok;
+    }
+}
 
 async fn run_ws_bridge(
     app: &tauri::AppHandle,
@@ -452,10 +531,22 @@ async fn run_ws_bridge(
                     eprintln!("[bridge] Extension connected ({} total)", client_count.load(Ordering::SeqCst));
                     let app = app.clone();
                     let client_count = Arc::clone(&client_count);
+                    let clients_for_broadcast = Arc::clone(&clients_send);
                     tauri::async_runtime::spawn(async move {
                         while let Some(Ok(msg)) = read.next().await {
                             if let Message::Text(text) = msg {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    if v.get("type").and_then(|t| t.as_str()) == Some("PARSE_AND_RUN")
+                                        && v.get("command").and_then(|c| c.as_str()).is_some()
+                                    {
+                                        let command = v["command"].as_str().unwrap_or("").to_string();
+                                        let app_clone = app.clone();
+                                        let clients_clone = Arc::clone(&clients_for_broadcast);
+                                        tauri::async_runtime::spawn(async move {
+                                            handle_parse_and_run(&app_clone, &command, &clients_clone).await;
+                                        });
+                                        continue;
+                                    }
                                     let m = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
                                     let _ = app.emit("extension-result", m);
                                 }

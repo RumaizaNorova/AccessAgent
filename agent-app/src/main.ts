@@ -71,7 +71,7 @@ function resolveUrl(payload: string): string {
 }
 
 const PAGE_LOAD_DELAY_MS = 3500;
-const extensionActions = ["click", "find", "find_and_read", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
+const extensionActions = ["click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
 
 async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "done"> {
   const { action: type, payload: p, target_type } = step;
@@ -177,6 +177,10 @@ function formatExtensionCommand(action: string, payload: string): string {
       return `find ${p}`;
     case "find_and_read":
       return `find_and_read ${p}`;
+    case "find_next":
+      return "find next match";
+    case "find_prev":
+      return "find prev match";
     case "page_search":
       return `search for ${p}`;
     case "scroll":
