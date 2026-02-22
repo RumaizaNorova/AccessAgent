@@ -20,7 +20,7 @@ function scheduleExtensionTimeout() {
   if (extensionResultTimeoutId) clearTimeout(extensionResultTimeoutId);
   extensionResultTimeoutId = setTimeout(() => {
     extensionResultTimeoutId = null;
-    speak("Extension didn't respond. Click the extension icon to wake it, refresh the tab, then try again.");
+    speak("Extension didn't respond. Make sure Chrome is open with a regular webpage, the AccessPilot extension is enabled, and try refreshing the tab.");
   }, EXTENSION_TIMEOUT_MS);
 }
 
@@ -81,6 +81,7 @@ function resolveNativeAppName(payload: string): string {
   const p = payload.trim().toLowerCase();
   const aliases: Record<string, string> = {
     email: "Mail",
+    "my email": "Mail",
     mail: "Mail",
     messages: "Messages",
     imessage: "Messages",
@@ -106,7 +107,7 @@ function resolveNativeAppName(payload: string): string {
 }
 
 const PAGE_LOAD_DELAY_MS = 3500;
-const extensionActions = ["click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
+const extensionActions = ["click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "go_to_page", "access_mode", "close_popup", "go_to", "type"];
 
 async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "done"> {
   const { action: type, payload: p, target_type } = step;
@@ -130,7 +131,7 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
     const looksLikeInPage = /\b(first|second|third|this|that)\s*(one|video|result|item)?\b/i.test(payload) || /\bvideo\b/i.test(payload);
     if (looksLikeInPage) {
       const sent = await invoke<boolean>("send_to_extension", { command: `click ${payload}` });
-      if (!sent) speak("Install the AccessPilot Chrome extension and refresh your tab.");
+      if (!sent) speak("Chrome extension not connected. Open Chrome, load AccessPilot from chrome://extensions, open a webpage, then try again.");
       else {
         pendingGoToIntent = null;
         scheduleExtensionTimeout();
@@ -157,17 +158,51 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
     return "opened_url";
   }
   if (type === "open_and_search") {
-    const [site, ...rest] = p.split("|").map((s) => s.trim());
-    const query = rest.join("|").trim();
+    let site = "";
+    let query = "";
+    if (p.includes("|")) {
+      const parts = p.split("|").map((s) => s.trim());
+      site = parts[0] || "";
+      query = parts.slice(1).join("|").trim();
+    } else {
+      // Parse "imagenet in wikipedia", "wikipedia imagenet", "look for X in Y" when GPT misses the pipe
+      const knownSites = ["wikipedia", "amazon", "google", "youtube", "reddit", "github", "ebay", "walmart", "gmail"];
+      const lower = p.toLowerCase().trim();
+      const inMatch = lower.match(/^(.+?)\s+in\s+(wikipedia|amazon|google|youtube|reddit|github|ebay|walmart|gmail)$/i);
+      const siteFirst = lower.match(/^(wikipedia|amazon|google|youtube|reddit|github|ebay|walmart|gmail)\s+(.+)$/i);
+      const siteLast = lower.match(/^(.+?)\s+(wikipedia|amazon|google|youtube|reddit|github|ebay|walmart|gmail)$/i);
+      if (inMatch) {
+        query = inMatch[1].replace(/^(look for|search for|find)\s+/i, "").trim();
+        site = inMatch[2].toLowerCase();
+      } else if (siteFirst) {
+        site = siteFirst[1].toLowerCase();
+        query = siteFirst[2].replace(/^(and |then |go to |look for |search for |find )/i, "").trim();
+      } else if (siteLast) {
+        site = siteLast[2].toLowerCase();
+        query = siteLast[1].replace(/^(look for|search for|find)\s+/i, "").trim();
+      } else {
+        const found = knownSites.find((s) => lower.includes(s));
+        if (found) {
+          site = found;
+          query = lower
+          .replace(new RegExp(found, "gi"), "")
+          .replace(/\b(open|and|in|go to|look for|search for|find|the)\b/gi, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        }
+      }
+    }
     if (!site || !query) {
-      speak("Try: open Amazon and search for candles.");
+      speak("I didn't get that. Try: open Wikipedia and search for imagenet.");
       return "done";
     }
     await invoke("open_url", { url: resolveUrl(site) });
     speak("Opening. Searching in a moment.");
     await new Promise((r) => setTimeout(r, PAGE_LOAD_DELAY_MS));
-    const sent = await invoke<boolean>("send_to_extension", { command: `search for ${query}` });
-    if (!sent) speak("Install the AccessPilot extension for in-page search.");
+    // Strip site:.org etc — GPT sometimes adds web-search modifiers; in-page search doesn't use them
+    const cleanQuery = query.replace(/\s*site:[^\s]*/gi, "").trim();
+    const sent = await invoke<boolean>("send_to_extension", { command: `search for ${cleanQuery}` });
+    if (!sent) speak("Chrome extension not connected. Open Chrome, load AccessPilot from chrome://extensions, open a webpage, then try again.");
     else scheduleExtensionTimeout();
     return "done";
   }
@@ -190,7 +225,7 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
   if (extensionActions.includes(type)) {
     const extCmd = formatExtensionCommand(type, p);
     const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
-    if (!sent) speak("Install the AccessPilot Chrome extension and refresh your tab, then try again.");
+    if (!sent) speak("Chrome extension not connected. Open Chrome, load AccessPilot from chrome://extensions, open a webpage, then try again.");
     else {
       if (type === "go_to") pendingGoToIntent = p;
       scheduleExtensionTimeout();
@@ -260,6 +295,10 @@ function formatExtensionCommand(action: string, payload: string): string {
       return "close popup";
     case "go_to":
       return `get_headings:${p}`;
+    case "go_to_page":
+      return `go_to_page:${p}`;
+    case "type":
+      return `type ${p}`;
     default:
       return `${action} ${p}`;
   }
@@ -378,7 +417,6 @@ function stopListeningWhisper(): Promise<StopResult | null> {
 async function processAndRun() {
   isListening = false;
   icon.classList.remove("listening");
-  speak("Transcribing.");
   try {
     const result = await stopListeningWhisper();
     if (!result) return;

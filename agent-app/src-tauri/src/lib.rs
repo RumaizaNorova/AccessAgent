@@ -56,12 +56,103 @@ pub struct ParsedIntent {
     pub chat_reply: Option<String>,
 }
 
+/// Strip trailing/leading punctuation so "Hi!", "Hello.", "hey?" all normalize to the base word.
+fn normalize_for_check(s: &str) -> String {
+    let t = s.trim()
+        .trim_start_matches(|c: char| c.is_ascii_punctuation())
+        .trim_end_matches(|c: char| c.is_ascii_punctuation());
+    t.trim().to_lowercase()
+}
+
+/// Fast-path: obvious conversational input — NEVER treat as search/command.
+/// Catches greetings, small talk, thanks, etc. so we never accidentally search for "hey".
+fn is_likely_conversation(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 80 {
+        return false;
+    }
+    let normalized = normalize_for_check(t);
+    let lower = t.to_lowercase();
+    // Must NOT contain command verbs — "search for hey" is a command
+    let has_command_verb = ["open ", "search ", "search for", "click ", "find ", "find and ", "scroll ", "go to ", "go to the ", "close the ", "close slack", "open gmail", "open amazon"].iter().any(|v| lower.contains(v));
+    if has_command_verb {
+        return false;
+    }
+    // Greetings — normalized "Hi!" -> "hi", "Hello." -> "hello"
+    let greetings = ["hey", "hi", "hello", "howdy", "yo", "hiya", "hey there", "hi there", "hello there"];
+    if greetings.iter().any(|g| normalized == *g || normalized.starts_with(&format!("{} ", g))) {
+        return true;
+    }
+    // "good morning" etc.
+    if lower.starts_with("good morning") || lower.starts_with("good afternoon") || lower.starts_with("good evening") || lower.starts_with("good night") {
+        return true;
+    }
+    // How are you, what's up (short phrases only)
+    if (lower.contains("how are you") || lower.contains("how're you")
+        || lower.contains("hows it going") || lower.contains("how's it going"))
+        && t.len() < 50
+    {
+        return true;
+    }
+    if (lower.contains("whats up") || lower.contains("what's up") || lower.contains("whats up")) && t.len() < 35 {
+        return true;
+    }
+    if (lower.contains("lets talk") || lower.contains("let's talk")) && t.len() < 30 {
+        return true;
+    }
+    // Thanks (normalized handles "Thanks!")
+    if normalized == "thanks" || normalized.starts_with("thank you") || normalized.starts_with("thanks ") {
+        return true;
+    }
+    // Bye
+    if normalized == "bye" || normalized == "goodbye" || normalized.starts_with("bye ") || normalized.starts_with("goodbye ") {
+        return true;
+    }
+    // Brief acknowledgments
+    if ["yes", "no", "ok", "okay", "sure", "yep", "nope", "alright", "cool"].contains(&normalized.as_str()) {
+        return true;
+    }
+    // "say hi", "just wanted to say hi"
+    if normalized == "say hi" || normalized.starts_with("say hi ") || normalized.starts_with("just saying hi") {
+        return true;
+    }
+    false
+}
+
 #[tauri::command]
 async fn parse_intent(
     command: String,
     api_key_override: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<ParsedIntent, String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Ok(ParsedIntent {
+            steps: vec![],
+            chat_reply: Some("What can I help you with?".into()),
+        });
+    }
+
+    // Fast-path: never search for greetings/small talk — always reply conversationally
+    if is_likely_conversation(trimmed) {
+        let reply = match trimmed.to_lowercase().as_str() {
+            s if s.starts_with("how are you") || s.contains("how are you") => "I'm doing well, thanks for asking! How can I help you today?",
+            s if s.contains("whats up") || s.contains("what's up") => "Not much! What can I do for you?",
+            s if s.starts_with("good morning") => "Good morning! How can I help?",
+            s if s.starts_with("good afternoon") => "Good afternoon! What would you like to do?",
+            s if s.starts_with("good evening") || s.starts_with("good night") => "Good evening! How can I assist you?",
+            s if s == "thanks" || s.starts_with("thank you") || s.starts_with("thanks ") => "You're welcome! Anything else?",
+            s if s == "bye" || s.starts_with("bye ") || s.starts_with("goodbye") => "Bye! Take care.",
+            s if s.contains("lets talk") || s.contains("let's talk") => "Sure! I'm here to chat. What's on your mind?",
+            s if s == "say hi" || s.starts_with("say hi") => "Hi there! Great to hear from you. What can I help with?",
+            _ => "Hey! What can I do for you?",
+        };
+        return Ok(ParsedIntent {
+            steps: vec![],
+            chat_reply: Some(reply.into()),
+        });
+    }
+
     let api_key = api_key_override
         .filter(|k| !k.is_empty())
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
@@ -73,48 +164,84 @@ async fn parse_intent(
         String::new()
     };
 
-    let system_prompt = r#"You are a smart assistant for users who cannot use mouse/keyboard. Classify intent: CONVERSATIONAL or COMMAND.
+    let system_prompt = r#"You are a friendly assistant. Users talk to you OR give commands. You MUST decide which.
 
-FIRST: Is this conversational (small talk, greetings, feelings, or questions that don't map to actions)?
-Use chat_reply ONLY when:
-- Greetings: "hi", "hello", "how are you", "good morning"
-- Small talk: "what's your name", "tell me about yourself", "that's funny"
-- Feelings/venting: "I'm frustrated", "this is confusing", "I'm tired"
-- Open questions without action: "what do you think", "why is that"
-- Filler: "ok", "umm", "thanks" (brief friendly acknowledgment)
+CRITICAL: CONVERSATION vs COMMAND
+- CONVERSATION = greetings (hi, hello, hey — with or without ! or .), small talk, venting, thanks, questions about you, chitchat, reactions. NEVER search for these. NEVER output search/find with the user's words as payload.
+- "Hi!", "Hello.", "hey" = ALWAYS conversation. Never search for "Hi" or "Hello".
+- Page URL does NOT change this. User on Google saying "hi" = CONVERSATION.
+- When unsure → CONVERSATION. Err on the side of talking, not searching. Single greetings = always conversation.
 
-Use steps (COMMAND) when the user wants to DO something:
-- Navigate: "open X", "go to Y", "search for Z"
-- On-page: "find X", "click Y", "scroll down", "type Z"
-- System: "what time is it", "what's the date", "stop"
-- Keyboard: "save", "close this app", "press Enter"
+Output ONLY one:
+1. CONVERSATION: {"intent":"conversation","chat_reply":"your friendly reply"}
+2. COMMAND: {"intent":"command","steps":[{"action","payload","target_type"}]}
 
-Output EITHER chat_reply OR steps, NEVER both.
+CONVERSATION: hey, hi, hello, how are you, what's up, let's talk, I had a rough day, thanks, good morning, bye, can you believe X, what do you think.
+COMMAND: open gmail, search for laptops, find the price, click submit.
 
-If CONVERSATIONAL → return: {"chat_reply": "your brief, friendly, natural reply (1-2 sentences max)"}
-If COMMAND → return: {"steps": [{"action": string, "payload": string, "target_type": "website"|"native_app"|null}, ...]}
+PAYLOAD: Extract concrete concepts. "find the eligibility" → payload "eligibility". "where does it say the deadline" → "deadline". "show me his parents" → "parents". Never use vague payloads like "the information" or "it".
+WRONG: User says "hey" → search. NEVER do that. RIGHT: {"intent":"conversation","chat_reply":"Hey! What can I do for you?"}
 
-ACTIONS: open, search, time, date, stop, click, find, find_and_read, find_next, find_prev, page_search, scroll, go_to, access_mode, close_popup, open_and_search, press_keys.
+ACTIONS: open, search, time, date, stop, click, find, find_and_read, find_next, find_prev, page_search, scroll, go_to, go_to_page, access_mode, close_popup, open_and_search, press_keys, type.
+PDF/DOCUMENT (when on PDF or doc viewer): "go to page 50", "page 50", "open page 50" = go_to_page 50. "scroll 5 pages down", "scroll down 5 pages" = scroll down:5. "find phony", "find the word X", "go to chapter 3" = find X (or go_to if sections exist).
+COMPOUND: "Go to X and search/look for Y", "look for Y in X", "open X and go to Y" = open_and_search "X|Y" (site|query). "look for imagenet in wikipedia" → "wikipedia|imagenet". Never add site:.org — we type into the site's search box.
 
-NATIVE APPS (target_type: "native_app"): Slack, Mail, Notes, Messages, Finder, Terminal, System Settings, Calendar, Reminders, Safari, Discord, Zoom, Spotify, Microsoft Teams, Outlook, OneNote, Notion, Visual Studio Code, Xcode. Map: "email"→Mail, "messages"→Messages, "notes"→Notes, "finder"→Finder, "settings"→System Settings, "calendar"→Calendar, "reminders"→Reminders, "vs code"→Visual Studio Code. Payload = exact app name.
+NATIVE APPS — ALWAYS use target_type: "native_app" for these. NEVER open them as web URLs:
+Slack, Mail, Notes, Messages, Finder, Terminal, System Settings, Calendar, Reminders, Safari, Discord, Zoom, Spotify, Microsoft Teams, Outlook, OneNote, Notion, Visual Studio Code, Xcode.
+Mappings: "email" or "mail"→Mail, "messages" or "imessage"→Messages, "notes"→Notes, "finder"→Finder, "settings" or "system preferences"→System Settings.
+Web-only (target_type null): Gmail, Amazon, Wikipedia, YouTube, Google, etc. — open in browser.
 
-KEYBOARD (press_keys): "press Command S", "save", "press Enter", "press Tab" = press_keys. Payload: "Command+S", "Enter", "Tab", "Escape", "Command+Q".
-- QUIT APP: "close [App]", "quit [App]", "exit Mail" = press_keys "Command+Q". NEVER use "stop" for quit.
-- CLOSE DIALOG: "close", "dismiss" = close_popup or press_keys "Escape".
-- Other: save=Command+S, undo=Command+Z, redo=Command+Shift+Z.
+TYPE: "type hello", "type john at gmail dot com" = type payload into focused text field. Voice substitutions: "at"→@, "dot"→. Preserve literal text. No Enter/submit unless user says "and submit".
+KEYBOARD: "save"→press_keys Command+S, "close [app]"→Command+Q, "close dialog"→close_popup or Escape.
+PAGE CONTEXT (when URL given): youtube.com→click "first video" not logo; wikipedia→find_and_read; on-page locate=find/find_and_read; web search=search. Ambiguous→on-page."#;
 
-USE PAGE CONTEXT (you get current URL when available):
-- youtube.com: "first video", "click the second one" = click "first video", "second video". NEVER "youtube home" or "logo".
-- wikipedia.org or articles: "find X", "scroll to X" = find_and_read X.
-- "Type X", "search here for X" = page_search X. "Send" = click send/submit.
-- On-page locate = find, find_and_read, go_to. Web search = search. Ambiguous → on-page.
-- Extract concepts: "the thing about money" → "price". "When it's due" → "deadline"."#;
-
+    // Put user message FIRST so intent isn't buried by page context
     let user_content = if page_context.is_empty() {
         command.clone()
     } else {
-        format!("[Page: {}]\nUser: {}", page_context, command)
+        format!("User: {}\n(Current page: {})", command, page_context)
     };
+
+    let messages: Vec<serde_json::Value> = vec![
+        serde_json::json!({"role": "system", "content": system_prompt}),
+        serde_json::json!({"role": "user", "content": "Let's talk with you. How are you doing?"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"conversation","chat_reply":"I'm doing well, thanks! Always happy to chat. What's on your mind?"}"#}),
+        serde_json::json!({"role": "user", "content": "hey"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"conversation","chat_reply":"Hey! What can I do for you?"}"#}),
+        serde_json::json!({"role": "user", "content": "how are you"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"conversation","chat_reply":"I'm doing well, thanks for asking! How can I help?"}"#}),
+        serde_json::json!({"role": "user", "content": "open gmail"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open","payload":"gmail","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "open Slack"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open","payload":"Slack","target_type":"native_app"}]}"#}),
+        serde_json::json!({"role": "user", "content": "open Mail"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open","payload":"Mail","target_type":"native_app"}]}"#}),
+        serde_json::json!({"role": "user", "content": "open Notes"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open","payload":"Notes","target_type":"native_app"}]}"#}),
+        serde_json::json!({"role": "user", "content": "open my email"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open","payload":"Mail","target_type":"native_app"}]}"#}),
+        serde_json::json!({"role": "user", "content": "search for best laptops 2024"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"search","payload":"best laptops 2024","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "go to Wikipedia and look for Geoffrey Hinton"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open_and_search","payload":"wikipedia|Geoffrey Hinton","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "look for imagenet in wikipedia"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open_and_search","payload":"wikipedia|imagenet","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "open wikipedia and go to imagenet"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"open_and_search","payload":"wikipedia|imagenet","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "User: hey\n(Current page: https://www.google.com)"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"conversation","chat_reply":"Hey! What can I do for you?"}"#}),
+        serde_json::json!({"role": "user", "content": "go to page 50"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"go_to_page","payload":"50","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "scroll 5 pages down"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"scroll","payload":"down 5","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "find the word phony"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"find","payload":"phony","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "type hello"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"type","payload":"hello","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": "type john at gmail dot com"}),
+        serde_json::json!({"role": "assistant", "content": r#"{"intent":"command","steps":[{"action":"type","payload":"john at gmail dot com","target_type":null}]}"#}),
+        serde_json::json!({"role": "user", "content": user_content}),
+    ];
 
     let client = reqwest::Client::new();
     let res = client
@@ -123,13 +250,10 @@ USE PAGE CONTEXT (you get current URL when available):
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "model": "gpt-4o",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
+            "messages": messages,
             "response_format": {"type": "json_object"},
             "max_tokens": 512,
-            "temperature": 0.05
+            "temperature": 0.4
         }))
         .send()
         .await
@@ -148,16 +272,28 @@ USE PAGE CONTEXT (you get current URL when available):
         .and_then(|c| c.message.content.as_ref())
         .ok_or("No response from OpenAI")?;
 
-    // Support: {"chat_reply": "..."} (conversational) OR {"steps": [...]} / {"action", "payload"} (commands)
+    // Parse: intent-first schema or legacy chat_reply/steps
     let value: serde_json::Value = serde_json::from_str(content).map_err(|e| format!("Parse error: {}", e))?;
 
-    // Conversational intent: return immediately, no steps
-    if let Some(reply) = value.get("chat_reply").and_then(|v| v.as_str()) {
-        let reply = reply.trim().to_string();
-        if !reply.is_empty() {
+    let intent = value.get("intent").and_then(|v| v.as_str());
+    let chat_reply_str = value.get("chat_reply").and_then(|v| v.as_str());
+
+    // Conversational intent: intent=conversation OR has chat_reply (legacy) with no command steps
+    if intent == Some("conversation") || (intent != Some("command") && chat_reply_str.is_some()) {
+        if let Some(reply) = chat_reply_str {
+            let reply = reply.trim().to_string();
+            if !reply.is_empty() {
+                return Ok(ParsedIntent {
+                    steps: vec![],
+                    chat_reply: Some(reply),
+                });
+            }
+        }
+        // intent=conversation but empty reply → generic friendly response
+        if intent == Some("conversation") {
             return Ok(ParsedIntent {
                 steps: vec![],
-                chat_reply: Some(reply),
+                chat_reply: Some("What can I help you with?".into()),
             });
         }
     }
@@ -183,21 +319,18 @@ USE PAGE CONTEXT (you get current URL when available):
             target_type: value.get("target_type").and_then(|v| v.as_str()).map(String::from),
         }]
     } else {
-        vec![Step {
-            action: "search".to_string(),
-            payload: command,
-            target_type: None,
-        }]
+        vec![] // No search fallback—ask for clarification instead
     };
 
-    let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to", "press_keys"];
+    let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "go_to_page", "access_mode", "close_popup", "go_to", "press_keys", "type"];
     steps.retain(|s| valid.contains(&s.action.as_str()));
+
+    // When parsing failed or no valid steps: conversational clarification, never default to search
     if steps.is_empty() {
-        steps = vec![Step {
-            action: "search".to_string(),
-            payload: command,
-            target_type: None,
-        }];
+        return Ok(ParsedIntent {
+            steps: vec![],
+            chat_reply: Some("I didn't quite get that. Could you say more, or try a command like: open Gmail, search for something, find text on the page.".into()),
+        });
     }
 
     // Correct GPT mistake: "youtube home" / "home" / "logo" on YouTube feed → "first video"
@@ -227,6 +360,32 @@ USE PAGE CONTEXT (you get current URL when available):
 
     // "close Slack", "quit the app", "exit Mail" etc. → press_keys Command+Q (GPT sometimes misses these)
     correct_quit_app(&command, &mut steps);
+
+    // Last-resort: model wrongly returned search/find with user's exact words — that's almost always convo
+    let single_action = steps.len() == 1;
+    let payload_matches_user = single_action
+        && normalize_for_check(&steps[0].payload) == normalize_for_check(command);
+    let action_is_search_or_find = single_action
+        && (steps[0].action.eq_ignore_ascii_case("search") || steps[0].action.eq_ignore_ascii_case("find"));
+    if payload_matches_user && action_is_search_or_find {
+        // User said "Hi!" and we got search "Hi!" — clearly wrong. Reply conversationally.
+        let norm = normalize_for_check(command);
+        let reply = if norm.contains("how are you") || norm.contains("how're you") {
+            "I'm doing well, thanks for asking! How can I help?"
+        } else if norm.contains("whats up") || norm.contains("what's up") {
+            "Not much! What can I do for you?"
+        } else if norm.starts_with("thanks") || norm.starts_with("thank you") {
+            "You're welcome! Anything else?"
+        } else if norm == "bye" || norm.starts_with("goodbye") {
+            "Bye! Take care."
+        } else {
+            "Hey! What can I do for you?"
+        };
+        return Ok(ParsedIntent {
+            steps: vec![],
+            chat_reply: Some(reply.into()),
+        });
+    }
 
     Ok(ParsedIntent {
         steps,
@@ -475,11 +634,25 @@ fn correct_quit_app(command: &str, steps: &mut Vec<Step>) {
     }];
 }
 
+/// Strip site:.org etc from search payloads — GPT adds web-search modifiers; in-page search doesn't use them.
+fn strip_site_modifier(payload: &str) -> String {
+    payload
+        .trim()
+        .split_whitespace()
+        .filter(|w| !w.to_lowercase().starts_with("site:"))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
 /// Format a step for the extension (matches main.ts formatExtensionCommand).
 fn format_step_for_extension(step: &Step, page_url: &str) -> Option<String> {
     let action = step.action.to_lowercase();
     let payload = if action == "click" {
         correct_youtube_click_payload(step.payload.trim(), page_url)
+    } else if action == "search" || action == "page_search" {
+        strip_site_modifier(&step.payload)
     } else {
         step.payload.trim().to_string()
     };
@@ -508,6 +681,8 @@ fn format_step_for_extension(step: &Step, page_url: &str) -> Option<String> {
         }
         "close_popup" => "close popup".into(),
         "go_to" => format!("get_headings:{payload}"),
+        "go_to_page" => format!("go_to_page:{payload}"),
+        "type" => format!("type {payload}"),
         _ => return None,
     };
     Some(cmd)
@@ -516,7 +691,7 @@ fn format_step_for_extension(step: &Step, page_url: &str) -> Option<String> {
 /// Steps that the extension can execute (open, search navigate from content script).
 const EXTENSION_EXECUTABLE: &[&str] = &[
     "open", "search", "click", "find", "find_and_read", "find_next", "find_prev",
-    "page_search", "scroll", "access_mode", "close_popup", "go_to",
+    "page_search", "scroll", "go_to_page", "access_mode", "close_popup", "go_to", "type",
 ];
 
 type WsWriter = futures_util::stream::SplitSink<
