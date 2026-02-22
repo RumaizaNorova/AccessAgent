@@ -64,16 +64,20 @@ Actions and payloads:
   Examples: "what's the date", "date", "what day is it", "today's date"
 - stop: Cancel or stop. payload = ""
   Examples: "stop", "cancel", "never mind", "forget it"
-- click: Click a button, link, or element on the current webpage. payload = what to click (e.g. "buy button", "submit", "login", "continue", "next")
-  Examples: "click the buy button", "click submit", "click continue", "press next", "hit the login button"
+- click: Click a button, link, or element on the current webpage. payload = what to click. Supports ordinals: "first", "second", "third", "the second one", "2nd item"
+  Examples: "click the buy button", "choose the second one", "select the third item", "pick the first result", "click submit", "click continue"
 - find: Find and highlight text or element on the page (scroll to it). payload = what to find
   Examples: "find login", "find the requirements", "scroll to contact", "show me the price"
 - page_search: Search box ON THE CURRENT PAGE (e.g. Amazon, any site). Use when user says "search for X", "look for X", "find X", or "on this page/search here/on the site I'm on" + search. payload = search query only (e.g. "candles")
   Examples: "search for candles", "search for shoes", "on this page search for candles", "on the website I'm on search for candles", "see the page I'm at and search for X" → page_search with payload "X"
-- scroll: Scroll the page. payload = "up", "down", "top", or "bottom"
-  Examples: "scroll down", "scroll up", "go to top", "scroll to bottom"
+- scroll: Scroll the page. payload = "direction" or "direction:amount". direction = up|down|top|bottom. amount = optional: "2", "3pages", "2pages", "little"(0.5), "lot"(2)
+  Examples: "scroll down" → "down", "scroll down three pages" → "down:3pages", "scroll up 2 pages" → "up:2pages", "scroll to top" → "top", "scroll to bottom" → "bottom", "scroll a little" → "down:little"
 - access_mode: Toggle one-hand / target boost mode. payload = "on" or "off"
   Examples: "access mode on", "target boost off"
+- close_popup: Close/dismiss the visible popup, modal, or dialog. payload = ""
+  Examples: "close popup", "dismiss", "close the dialog", "close"
+- go_to: Navigate to a section or part of the page by meaning. User describes what they want to see. payload = their exact phrase
+  Examples: "go to the part about his education", "show me his early life", "find where it talks about his career", "take me to the section on awards", "where does it mention his education"
 - open_and_search: Open a website THEN search on it. payload = "site|query" (e.g. "amazon|candles", "wikipedia|Albert Einstein"). Site can be "amazon", "amazon.com", "wikipedia", etc.
   Examples: "open Amazon and search for candles", "go to Amazon and look for shoes", "open Wikipedia and search for Einstein", "take me to eBay and search for headphones"
 
@@ -81,7 +85,8 @@ Rules:
 - open vs click: open = navigate to new URL or launch app. click = interact with element on current page.
 - search vs page_search: DEFAULT to page_search for "search for X" — user is usually on a site. Use search (web) only when they say "google", "on the web", or ask a knowledge question.
 - open_and_search: Use when user says "open X and search for Y" or "go to X and look for Y" — one command does both.
-- Understand synonyms: "launch", "go to" → open. "press", "hit" → click. "find", "show me", "scroll to" → find.
+- Understand synonyms: "launch", "go to" → open. "press", "hit", "choose", "select", "pick" → click. "find", "show me", "scroll to" → find.
+- go_to vs find: go_to = navigate to a SECTION of the page (headings like Education, Career). find = locate specific text and highlight it.
 - Preserve the user's exact words in payload when relevant."#;
 
     let client = reqwest::Client::new();
@@ -120,7 +125,7 @@ Rules:
 
     // Validate action (agent handles some, extension handles in-page)
     let agent_actions = ["open", "search", "time", "date", "stop"];
-    let extension_actions = ["click", "find", "page_search", "scroll", "access_mode", "open_and_search"];
+    let extension_actions = ["click", "find", "page_search", "scroll", "access_mode", "open_and_search", "close_popup", "go_to"];
     let valid: Vec<&str> = agent_actions.iter().chain(extension_actions.iter()).copied().collect();
     if !valid.contains(&intent.action.as_str()) {
         return Ok(ParsedIntent {
@@ -130,6 +135,59 @@ Rules:
     }
 
     Ok(intent)
+}
+
+/// GPT picks the best-matching section from page headings given user intent.
+#[tauri::command]
+async fn resolve_section(intent: String, headings: Vec<String>) -> Result<String, String> {
+    if headings.is_empty() {
+        return Err("No sections found on this page".into());
+    }
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| "No API key".to_string())?;
+    let headings_str = headings.join("\n");
+    let prompt = format!(
+        r#"The user wants to go to a part of the page. They said: "{}"
+
+These are the section headings on the page (one per line):
+{}
+{}
+
+Return ONLY the exact heading text that best matches what the user wants, or "NONE" if none match. No explanation, no quotes."#,
+        intent,
+        headings_str,
+        if headings.len() > 1 { "Pick the single best match. Return the heading exactly as shown above." } else { "" }
+    );
+    let client = reqwest::Client::new();
+    let res = client
+        .post("https://api.openai.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 64,
+            "temperature": 0.1
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("API error: {}", text));
+    }
+    let body: OpenAIResponse = res.json().await.map_err(|e| e.to_string())?;
+    let content = body
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_ref())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let section = content.trim_matches('"').trim();
+    if section.eq_ignore_ascii_case("none") || section.is_empty() {
+        return Err("Couldn't find a matching section".into());
+    }
+    Ok(section.to_string())
 }
 
 /// Extract error message from OpenAI API response. Surfaces the real error.
@@ -316,6 +374,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             parse_intent,
+            resolve_section,
             whisper_available,
             transcribe_audio,
             open_url,

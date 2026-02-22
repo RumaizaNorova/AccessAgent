@@ -119,14 +119,15 @@ async function runCommand(text: string) {
     return;
   }
 
-  // In-page actions: click, find, page_search, scroll, access_mode — send to extension
-  const extensionActions = ["click", "find", "page_search", "scroll", "access_mode"];
+  // In-page actions: click, find, page_search, scroll, access_mode, close_popup, go_to — send to extension
+  const extensionActions = ["click", "find", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
   if (extensionActions.includes(parsed.type)) {
     const extCmd = formatExtensionCommand(parsed.type, parsed.payload);
     const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
     if (!sent) {
       speak("Install the AccessPilot Chrome extension and refresh your tab, then try again.");
     } else {
+      if (parsed.type === "go_to") pendingGoToIntent = parsed.payload;
       scheduleExtensionTimeout();
     }
     return;
@@ -145,11 +146,13 @@ function formatExtensionCommand(action: string, payload: string): string {
     case "page_search":
       return `search for ${p}`;
     case "scroll":
-      return ["up", "down", "top", "bottom"].includes(p.toLowerCase())
-        ? `scroll ${p.toLowerCase()}`
-        : `scroll ${p}`;
+      return `scroll ${p.toLowerCase()}`;
     case "access_mode":
       return p.toLowerCase() === "on" ? "one-hand mode on" : "one-hand mode off";
+    case "close_popup":
+      return "close popup";
+    case "go_to":
+      return `get_headings:${p}`;
     default:
       return `${action} ${p}`;
   }
@@ -275,14 +278,35 @@ getCurrentWindow()
 // Timeout when extension doesn't respond (e.g. not connected or wrong tab)
 let extensionResultTimeoutId: ReturnType<typeof setTimeout> | null = null;
 const EXTENSION_TIMEOUT_MS = 5000;
+// Two-phase go_to: we sent get_headings, waiting for headings to resolve via GPT
+let pendingGoToIntent: string | null = null;
 
 // Speak results from extension (click, find, search, etc.)
-listen<string>("extension-result", (e) => {
+listen<string>("extension-result", async (e) => {
   if (extensionResultTimeoutId) {
     clearTimeout(extensionResultTimeoutId);
     extensionResultTimeoutId = null;
   }
-  if (e.payload) speak(e.payload);
+  const payload = e.payload || "";
+  if (pendingGoToIntent && payload.startsWith("HEADINGS:")) {
+    const json = payload.slice(9).trim();
+    const intent = pendingGoToIntent;
+    pendingGoToIntent = null;
+    try {
+      const headings: string[] = JSON.parse(json);
+      const section = await invoke<string>("resolve_section", { intent, headings });
+      const sent = await invoke<boolean>("send_to_extension", {
+        command: `scroll_to_section:${section}`,
+      });
+      if (!sent) speak("Couldn't scroll to that section.");
+      else scheduleExtensionTimeout();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      speak(shortenForTts(msg));
+    }
+    return;
+  }
+  if (payload) speak(payload);
 }).catch(() => {});
 
 icon.addEventListener("pointerdown", async (e) => {
