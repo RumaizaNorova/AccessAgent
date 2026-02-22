@@ -5,6 +5,7 @@ import { requestPermission } from "tauri-plugin-stt-api";
 import AudioRecorder from "audio-recorder-polyfill";
 
 const icon = document.getElementById("icon")!;
+const agentWrap = document.getElementById("agent-wrap")!;
 
 function speak(text: string) {
   if (!text) return;
@@ -70,6 +71,35 @@ function resolveUrl(payload: string): string {
   return `https://www.${key}.com`;
 }
 
+/** Map user phrases to macOS app names for open_app. */
+function resolveNativeAppName(payload: string): string {
+  const p = payload.trim().toLowerCase();
+  const aliases: Record<string, string> = {
+    email: "Mail",
+    mail: "Mail",
+    messages: "Messages",
+    imessage: "Messages",
+    notes: "Notes",
+    finder: "Finder",
+    settings: "System Settings",
+    "system settings": "System Settings",
+    "system preferences": "System Settings",
+    calendar: "Calendar",
+    reminders: "Reminders",
+    "vs code": "Visual Studio Code",
+    vscode: "Visual Studio Code",
+    "visual studio code": "Visual Studio Code",
+    slack: "Slack",
+    discord: "Discord",
+    zoom: "Zoom",
+    spotify: "Spotify",
+    teams: "Microsoft Teams",
+    outlook: "Outlook",
+    notion: "Notion",
+  };
+  return aliases[p] || payload.trim();
+}
+
 const PAGE_LOAD_DELAY_MS = 3500;
 const extensionActions = ["click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
 
@@ -104,15 +134,16 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
     }
     const wantsNativeApp = target_type === "native_app";
     if (wantsNativeApp) {
+      const appName = resolveNativeAppName(payload);
       try {
-        await invoke("open_app", { name: payload });
+        await invoke("open_app", { name: appName });
       } catch {
         await invoke("open_url", { url: resolveUrl(payload) });
       }
     } else {
       await invoke("open_url", { url: resolveUrl(payload) });
     }
-    speak(`Opening ${payload}`);
+    speak(`Opening ${wantsNativeApp ? resolveNativeAppName(payload) : payload}`);
     return "opened_url";
   }
   if (type === "search") {
@@ -135,6 +166,22 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
     else scheduleExtensionTimeout();
     return "done";
   }
+  if (type === "press_keys") {
+    try {
+      // Restore focus to the app we stole it from (e.g. Chrome) so keystroke goes there
+      if (lastFocusedAppBundleId) {
+        await invoke("activate_app", { bundleId: lastFocusedAppBundleId });
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      const combo = normalizeKeyCombo(p.trim());
+      await invoke("press_keys", { payload: combo });
+      speak(`Pressed ${combo}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      speak(shortenForTts(msg));
+    }
+    return "done";
+  }
   if (extensionActions.includes(type)) {
     const extCmd = formatExtensionCommand(type, p);
     const sent = await invoke<boolean>("send_to_extension", { command: extCmd });
@@ -146,6 +193,16 @@ async function executeStep(step: Step): Promise<"opened_url" | "sent_to_ext" | "
     return "sent_to_ext";
   }
   return "done";
+}
+
+/** Normalize key combo for press_keys: "Command+S" (rdev uses Meta for Command on Mac). */
+function normalizeKeyCombo(p: string): string {
+  return p
+    .replace(/\s+/g, "")
+    .replace(/\bcmd\b/gi, "Command")
+    .replace(/\bctrl\b/gi, "Control")
+    .replace(/\balt\b/gi, "Option")
+    .replace(/\bopt\b/gi, "Option");
 }
 
 async function runCommand(text: string) {
@@ -211,9 +268,11 @@ function getMediaRecorderConstructor(): typeof MediaRecorder {
   return prefersMp4 ? (AudioRecorder as unknown as typeof MediaRecorder) : MediaRecorder;
 }
 
-const CHUNK_INTERVAL_MS = 100; // Request chunks during recording so we capture short utterances and don't rely on final flush
+const CHUNK_INTERVAL_MS = 100;
+const SILENCE_MS = 1200; // Auto-stop after 1.2s silence (no second tap needed)
+const SILENCE_CHECK_MS = 100;
 
-async function startListeningWhisper() {
+async function startListeningWhisper(onSilence?: () => void) {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   const Recorder = getMediaRecorderConstructor();
   const mimeType = Recorder === AudioRecorder
@@ -228,8 +287,36 @@ async function startListeningWhisper() {
     if (e.data.size > 0) audioChunks.push(e.data);
   };
   recorder.addEventListener("dataavailable", onData);
-  recorder.start(CHUNK_INTERVAL_MS); // Timeslice = get chunks during recording, not just at stop
+  recorder.start(CHUNK_INTERVAL_MS);
   mediaRecorder = recorder as MediaRecorder;
+
+  // Auto-stop on silence: one tap, talk, done (accessibility-friendly)
+  if (onSilence && typeof AudioContext !== "undefined") {
+    const ctx = new AudioContext();
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.8;
+    src.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    let lastSpeechAt = 0;
+    let hasHeardSpeech = false;
+    const check = () => {
+      if (!mediaRecorder || mediaRecorder.state === "inactive") return;
+      analyser.getByteFrequencyData(data);
+      const avg = data.reduce((a, b) => a + b, 0) / data.length;
+      if (avg > 15) {
+        hasHeardSpeech = true;
+        lastSpeechAt = Date.now();
+      }
+      if (hasHeardSpeech && Date.now() - lastSpeechAt > SILENCE_MS) {
+        onSilence();
+        return;
+      }
+      setTimeout(check, SILENCE_CHECK_MS);
+    };
+    setTimeout(check, 500); // Start after a brief delay
+  }
 }
 
 type StopResult = { base64: string; mimeType: string } | { error: string };
@@ -276,13 +363,48 @@ function stopListeningWhisper(): Promise<StopResult | null> {
   });
 }
 
+async function processAndRun() {
+  isListening = false;
+  icon.classList.remove("listening");
+  speak("Transcribing.");
+  try {
+    const result = await stopListeningWhisper();
+    if (!result) return;
+    if ("error" in result) {
+      speak(result.error);
+      return;
+    }
+    const txt = await invoke<string>("transcribe_audio", {
+      base64Audio: result.base64,
+      mimeType: result.mimeType,
+    });
+    if (txt && txt !== lastProcessed) {
+      lastProcessed = txt;
+      try {
+        await runCommand(txt);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("Command error:", msg);
+        speak(shortenForTts(msg));
+      }
+      setTimeout(() => { lastProcessed = ""; }, 2000);
+    } else if (!txt || !txt.trim()) {
+      speak("No speech detected. Try again.");
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("Transcription error:", msg);
+    speak(shortenForTts(msg));
+  }
+}
+
 async function startListening() {
   if (isStarting) {
     speak("Please wait.");
     return;
   }
   if (isListening) {
-    speak("Already recording. Click again to stop.");
+    await processAndRun();
     return;
   }
   isStarting = true;
@@ -298,7 +420,9 @@ async function startListening() {
       return;
     }
     speak("Listening.");
-    await startListeningWhisper();
+    await startListeningWhisper(() => {
+      if (isListening) processAndRun();
+    });
     isListening = true;
     icon.classList.add("listening");
   } catch (e) {
@@ -312,6 +436,28 @@ async function startListening() {
 getCurrentWindow()
   .setFocus()
   .catch(() => {});
+
+// Store app that had focus before we stole it (so press_keys goes there, not to us)
+let lastFocusedAppBundleId: string | null = null;
+
+// Global hotkey: Option+Space — summon agent and start listening from anywhere
+import("@tauri-apps/plugin-global-shortcut")
+  .then(({ register }) =>
+    register("Alt+Space", async () => {
+      // Capture frontmost app BEFORE we steal focus
+      try {
+        const bundleId = await invoke<string | null>("get_frontmost_app");
+        if (bundleId && !bundleId.toLowerCase().includes("accesspilot")) {
+          lastFocusedAppBundleId = bundleId;
+        }
+      } catch {
+        // ignore
+      }
+      getCurrentWindow().setFocus().catch(() => {});
+      startListening();
+    })
+  )
+  .catch((e) => console.warn("[AccessPilot] Hotkey unavailable:", e));
 
 // Timeout when extension doesn't respond (e.g. not connected or wrong tab)
 let extensionResultTimeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -347,44 +493,24 @@ listen<string>("extension-result", async (e) => {
   if (payload) speak(payload);
 }).catch(() => {});
 
-icon.addEventListener("pointerdown", async (e) => {
-  e.preventDefault();
-  e.stopPropagation();
+async function handleMicAction() {
   if (isStarting) return;
   if (isListening) {
-    isListening = false;
-    icon.classList.remove("listening");
-    speak("Transcribing.");
-    try {
-      const result = await stopListeningWhisper();
-      if (!result) return;
-      if ("error" in result) {
-        speak(result.error);
-        return;
-      }
-      const txt = await invoke<string>("transcribe_audio", {
-        base64Audio: result.base64,
-        mimeType: result.mimeType,
-      });
-      if (txt && txt !== lastProcessed) {
-        lastProcessed = txt;
-        try {
-          await runCommand(txt);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error("Command error:", msg);
-          speak(shortenForTts(msg));
-        }
-        setTimeout(() => { lastProcessed = ""; }, 2000);
-      } else if (!txt || !txt.trim()) {
-        speak("No speech detected. Try speaking again.");
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("Transcription error:", msg);
-      speak(shortenForTts(msg));
-    }
-  } else {
-    await startListening();
+    await processAndRun();
+    return;
   }
+  await startListening();
+}
+
+// Whole window is one big tap target — click/tap anywhere
+agentWrap.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  handleMicAction();
+});
+// Also on icon for redundancy
+icon.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  handleMicAction();
 });

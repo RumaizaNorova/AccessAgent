@@ -47,9 +47,10 @@ Done. The extension connects to the agent automatically.
 
 ## Use
 
-1. **Click** the blue icon → speak
-2. **Click again** → agent runs your command
-3. Use Chrome for web (the extension runs there)
+1. **Option+Space** — Global hotkey to summon agent and start listening (from any app)
+2. **Click** the blue icon → speak
+3. **Click again** → agent runs your command
+4. Use Chrome for web (the extension runs there)
 
 **Examples**
 
@@ -57,10 +58,14 @@ Done. The extension connects to the agent automatically.
 |-----|------|
 | Open Amazon and search for candles | Opens Amazon, then searches on it |
 | Open wikipedia | Opens Wikipedia |
+| Open Slack / Open Mail / Open Notes | Opens native app (Slack, Mail, Notes) |
 | Search for shoes | Searches on the current page |
 | Click the buy button | Clicks it |
 | What time is it | Speaks the time |
+| Press Command S / Save | Simulates Cmd+S in the frontmost app |
 | Scroll down | Scrolls the page |
+
+**Press keys:** Commands like "press Command S", "save", "press Enter" simulate keystrokes. Requires **Accessibility** permission. Use `npm run tauri:dev:ax` instead of `npm run tauri dev` (add AccessPilot-debug.app to Accessibility first; run `./scripts/make-debug-app.sh` once after first build).
 
 ---
 

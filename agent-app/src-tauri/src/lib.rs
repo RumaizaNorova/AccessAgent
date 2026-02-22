@@ -4,9 +4,12 @@ use base64::{
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::multipart;
+use rdev::{Key, simulate, EventType};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
@@ -51,43 +54,46 @@ pub struct ParsedIntent {
 }
 
 #[tauri::command]
-async fn parse_intent(command: String, api_key_override: Option<String>) -> Result<ParsedIntent, String> {
+async fn parse_intent(
+    command: String,
+    api_key_override: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<ParsedIntent, String> {
     let api_key = api_key_override
         .filter(|k| !k.is_empty())
         .or_else(|| std::env::var("OPENAI_API_KEY").ok())
         .ok_or("No API key. Set OPENAI_API_KEY env var or add your key in Settings.")?;
 
-    let system_prompt = r#"You are an intelligent assistant that turns natural speech into executable plans for users with motor conditions (e.g. Parkinson's) who cannot use mouse/keyboard freely. Understand INTENT and MEANING—do not match keywords. People phrase things differently; infer what they want. The agent supports synonym-aware finding (price=cost, deadline=due date, etc.).
+    let page_context = if let Some(bridge) = app.try_state::<ExtensionBridge>() {
+        bridge.last_tab_url.lock().await.as_ref().cloned().unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let system_prompt = r#"You are a smart assistant that turns natural speech into executable plans for users who cannot use mouse/keyboard. INFER what they mean—don't match keywords. Use common sense.
 
 Return ONLY valid JSON (no markdown, no explanation):
 {"steps": [{"action": string, "payload": string, "target_type": "website"|"native_app"|null}, ...]}
 
-ACTIONS (map to the intent, any wording):
-- open: Navigate to a site or app. payload = canonical name. target_type: "website" or "native_app".
-- search: Open a search engine and query the web. ONLY when intent is "search the internet" or "look something up online". NOT when locating info on the current page.
-- time, date, stop: payload = ""
-- click: Interact with something on the current page (button, link, item). payload = what to click. Synonyms supported: "continue"="next", "sign in"="login", etc.
-- find: Locate and highlight text on the page. payload = concept or phrase (eligibility, price, deadline, shipping, requirements—synonyms work).
-- find_and_read: Locate text, scroll TO it, read it. Use when user wants to FIND and scroll to specific content. payload = what to locate.
-- find_next, find_prev: Cycle through multiple find results. "next match", "previous result", "next one", "go to next" → find_next. "previous match", "go back" (in find context) → find_prev. payload = "".
-- page_search: Type into the search box on the current page. payload = query.
-- scroll: ONLY for generic page motion—"scroll down", "scroll up", "scroll to top". When user wants to scroll TO something → use find_and_read or go_to.
-- go_to: Navigate to a section by meaning. payload = section topic (shipping, eligibility, contact, etc.).
-- access_mode, close_popup, open_and_search: as needed.
+ACTIONS: open, search, time, date, stop, click, find, find_and_read, find_next, find_prev, page_search, scroll, go_to, access_mode, close_popup, open_and_search, press_keys.
 
-CRITICAL—UNDERSTAND CONTEXT:
-1. ON-PAGE = user wants to locate/retrieve/view something on the document. Intent: "where is X", "what does it say about X", "scroll so I can see X", "find X".
-   → find, find_and_read, go_to. Extract the CONCEPT: "cost" not "the thing about money".
+NATIVE APPS (use target_type: "native_app"): Slack, Mail, Notes, Messages, Finder, Terminal, System Settings, Calendar, Reminders, Safari, Discord, Zoom, Spotify, Microsoft Teams, Outlook, OneNote, Notion, Visual Studio Code, Xcode. Map: "email"→Mail, "messages"→Messages, "notes"→Notes, "finder"→Finder, "settings"→System Settings, "calendar"→Calendar, "reminders"→Reminders, "vs code"→Visual Studio Code. For these, payload = exact app name (e.g. "Mail", "Slack").
 
-2. "Find X and scroll to it" / "scroll down to the X" = find_and_read X. NEVER bare scroll for targeted scrolling.
+KEYBOARD: "press Command S", "save", "press Enter", "press Tab", "press Escape" = press_keys. Payload format: "Command+S", "Enter", "Tab", "Escape", "Command+Shift+Z". Common: save=Command+S, close=Escape, undo=Command+Z, redo=Command+Shift+Z.
 
-3. WEB SEARCH = only when explicitly "search the web". Default to on-page when ambiguous.
+USE PAGE CONTEXT (you get current URL when available):
+- youtube.com: "first video" / "click the second one" / "click that" / "open it" / "play that" = click "first video", "second video". Never "open" when they mean click an item on the page.
+- CRITICAL on youtube.com: When user picks a video ("that one", "first", "this", "it", "the cat video") → use click "first video", "second video", etc. NEVER use "youtube home", "home", or "logo" as payload—that goes to homepage, not the video.
+- wikipedia.org or articles: "find X on this page" / "scroll to X" = find_and_read X.
+- "Type X" / "write X" / "search here for X" = page_search X. "Send" = click send/submit.
+- Locating info ON the page = find, find_and_read, go_to. Web search = search. Ambiguous → on-page.
+- Extract concepts: "the thing about money" → "price". "When it's due" → "deadline". Never vague payloads."#;
 
-4. Extract concrete payloads: "eligibility", "deadline", "price", "shipping", "his parents"—never "information" or "the thing". Use the core concept; the system expands synonyms.
-
-5. "Next match", "next result", "show me the next one" (after a find) = find_next. "Previous", "go back" (in find context) = find_prev.
-
-PLANNING: Compound = multiple steps. Single = one step."#;
+    let user_content = if page_context.is_empty() {
+        command.clone()
+    } else {
+        format!("[Page: {}]\nUser: {}", page_context, command)
+    };
 
     let client = reqwest::Client::new();
     let res = client
@@ -98,7 +104,7 @@ PLANNING: Compound = multiple steps. Single = one step."#;
             "model": "gpt-4o",
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": command}
+                {"role": "user", "content": user_content}
             ],
             "response_format": {"type": "json_object"},
             "max_tokens": 512,
@@ -153,7 +159,7 @@ PLANNING: Compound = multiple steps. Single = one step."#;
         });
     };
 
-    let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to"];
+    let valid = ["open", "search", "time", "date", "stop", "open_and_search", "click", "find", "find_and_read", "find_next", "find_prev", "page_search", "scroll", "access_mode", "close_popup", "go_to", "press_keys"];
     steps.retain(|s| valid.contains(&s.action.as_str()));
     if steps.is_empty() {
         steps = vec![Step {
@@ -161,6 +167,13 @@ PLANNING: Compound = multiple steps. Single = one step."#;
             payload: command,
             target_type: None,
         }];
+    }
+
+    // Correct GPT mistake: "youtube home" / "home" / "logo" on YouTube feed → "first video"
+    for step in &mut steps {
+        if step.action.eq_ignore_ascii_case("click") {
+            step.payload = correct_youtube_click_payload(&step.payload, &page_context);
+        }
     }
 
     Ok(ParsedIntent { steps })
@@ -343,12 +356,51 @@ async fn open_app(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// "first video", "second one", "the third result" = in-page click, not navigation
+fn looks_like_in_page_click(payload: &str) -> bool {
+    let p = payload.to_lowercase();
+    (p.contains("first") || p.contains("second") || p.contains("third") || p.contains("fourth") || p.contains("fifth") || p.contains("this") || p.contains("that"))
+        && (p.contains("video") || p.contains("one") || p.contains("result") || p.contains("item") || p.len() < 25)
+        || p.contains("the video")
+        || p == "video"
+}
+
+/// On YouTube feed/search, GPT wrongly outputs "youtube home" / "home" / "logo" (matches logo aria-label).
+/// Correct to "first video" so we click a video, not the homepage link.
+fn correct_youtube_click_payload(payload: &str, page_url: &str) -> String {
+    if !page_url.contains("youtube.com") && !page_url.contains("youtu.be") {
+        return payload.to_string();
+    }
+    if page_url.contains("/watch") || page_url.contains("youtu.be/") {
+        return payload.to_string(); // already on watch page, don't correct
+    }
+    let p = payload.trim().to_lowercase();
+    let wrong = p == "youtube home" || p == "youtube  home" || p == "logo"
+        || p == "home"
+        || p == "youtube";
+    if wrong {
+        "first video".to_string()
+    } else {
+        payload.to_string()
+    }
+}
+
 /// Format a step for the extension (matches main.ts formatExtensionCommand).
-fn format_step_for_extension(step: &Step) -> Option<String> {
+fn format_step_for_extension(step: &Step, page_url: &str) -> Option<String> {
     let action = step.action.to_lowercase();
-    let payload = step.payload.trim();
+    let payload = if action == "click" {
+        correct_youtube_click_payload(step.payload.trim(), page_url)
+    } else {
+        step.payload.trim().to_string()
+    };
     let cmd = match action.as_str() {
-        "open" => format!("open {payload}"),
+        "open" => {
+            if looks_like_in_page_click(&payload) {
+                format!("click {payload}")
+            } else {
+                format!("open {payload}")
+            }
+        }
         "search" => format!("search for {payload}"),
         "click" => format!("click {payload}"),
         "find" => format!("find {payload}"),
@@ -382,6 +434,133 @@ type WsWriter = futures_util::stream::SplitSink<
     tokio_tungstenite::tungstenite::Message,
 >;
 
+/// Parse key string like "Command+S", "Enter", "Tab" into (modifiers, main_key).
+fn parse_key_combo(payload: &str) -> Result<(Vec<Key>, Key), String> {
+    let s = payload.trim().replace([' ', '\t'], "");
+    if s.is_empty() {
+        return Err("Empty key combo".into());
+    }
+    let parts: Vec<&str> = s.split('+').collect();
+    let mut modifiers = Vec::new();
+    let mut main_key = None;
+    for p in parts {
+        let p_lower = p.to_lowercase();
+        match p_lower.as_str() {
+            "command" | "cmd" | "meta" => modifiers.push(Key::MetaLeft),
+            "control" | "ctrl" => modifiers.push(Key::ControlLeft),
+            "option" | "alt" => modifiers.push(Key::Alt),
+            "shift" => modifiers.push(Key::ShiftLeft),
+            _ => {
+                if main_key.is_some() {
+                    return Err(format!("Multiple main keys in '{}'", payload));
+                }
+                main_key = Some(parse_single_key(p));
+            }
+        }
+    }
+    let main = main_key.ok_or_else(|| format!("No main key in '{}'", payload))?;
+    Ok((modifiers, main))
+}
+
+fn parse_single_key(s: &str) -> Key {
+    match s.to_lowercase().as_str() {
+        "enter" | "return" => Key::Return,
+        "tab" => Key::Tab,
+        "escape" | "esc" => Key::Escape,
+        "space" => Key::Space,
+        "backspace" => Key::Backspace,
+        "delete" => Key::Delete,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" | "pgup" => Key::PageUp,
+        "pagedown" | "pgdown" => Key::PageDown,
+        "left" | "leftarrow" => Key::LeftArrow,
+        "right" | "rightarrow" => Key::RightArrow,
+        "up" | "uparrow" => Key::UpArrow,
+        "down" | "downarrow" => Key::DownArrow,
+        c if c.len() == 1 => {
+            let ch = c.chars().next().unwrap();
+            match ch {
+                'a' => Key::KeyA, 'b' => Key::KeyB, 'c' => Key::KeyC, 'd' => Key::KeyD,
+                'e' => Key::KeyE, 'f' => Key::KeyF, 'g' => Key::KeyG, 'h' => Key::KeyH,
+                'i' => Key::KeyI, 'j' => Key::KeyJ, 'k' => Key::KeyK, 'l' => Key::KeyL,
+                'm' => Key::KeyM, 'n' => Key::KeyN, 'o' => Key::KeyO, 'p' => Key::KeyP,
+                'q' => Key::KeyQ, 'r' => Key::KeyR, 's' => Key::KeyS, 't' => Key::KeyT,
+                'u' => Key::KeyU, 'v' => Key::KeyV, 'w' => Key::KeyW, 'x' => Key::KeyX,
+                'y' => Key::KeyY, 'z' => Key::KeyZ,
+                '0' => Key::Num0, '1' => Key::Num1, '2' => Key::Num2, '3' => Key::Num3,
+                '4' => Key::Num4, '5' => Key::Num5, '6' => Key::Num6, '7' => Key::Num7,
+                '8' => Key::Num8, '9' => Key::Num9,
+                '-' => Key::Minus, '=' => Key::Equal, ',' => Key::Comma, '.' => Key::Dot,
+                '/' => Key::Slash, ';' => Key::SemiColon, '\'' => Key::Quote,
+                '[' => Key::LeftBracket, ']' => Key::RightBracket, '`' => Key::BackQuote,
+                _ => Key::Space,
+            }
+        }
+        _ => Key::Space,
+    }
+}
+
+/// Get the bundle ID of the frontmost application (before we steal focus).
+#[tauri::command]
+fn get_frontmost_app() -> Result<Option<String>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("osascript")
+            .args(["-e", "tell application \"System Events\" to get bundle identifier of (first process whose frontmost is true)"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !s.is_empty() && !s.contains("error") {
+                return Ok(Some(s));
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ();
+    }
+    Ok(None)
+}
+
+/// Activate (bring to front) an application by bundle ID.
+#[tauri::command]
+fn activate_app(bundle_id: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"System Events\" to set frontmost of first process whose bundle identifier is \"{}\" to true",
+            bundle_id.replace('"', "\\\"")
+        );
+        Command::new("osascript").args(["-e", &script]).output().map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = bundle_id;
+    }
+    Ok(())
+}
+
+/// Press key combo (e.g. "Command+S", "Enter"). Requires Accessibility permission on macOS.
+#[tauri::command]
+fn press_keys(payload: String) -> Result<(), String> {
+    let (modifiers, main) = parse_key_combo(&payload)?;
+    // Press modifiers, then main key, then release in reverse order.
+    for m in &modifiers {
+        simulate(&EventType::KeyPress(*m)).map_err(|e| e.to_string())?;
+        thread::sleep(Duration::from_millis(10));
+    }
+    simulate(&EventType::KeyPress(main)).map_err(|e| e.to_string())?;
+    thread::sleep(Duration::from_millis(20));
+    simulate(&EventType::KeyRelease(main)).map_err(|e| e.to_string())?;
+    for m in modifiers.iter().rev() {
+        thread::sleep(Duration::from_millis(10));
+        simulate(&EventType::KeyRelease(*m)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Send command to extension via WebSocket bridge. Returns true if sent to at least one connected extension.
 #[tauri::command]
 async fn send_to_extension(command: String, app: tauri::AppHandle) -> Result<bool, String> {
@@ -404,6 +583,7 @@ async fn send_to_extension(command: String, app: tauri::AppHandle) -> Result<boo
 struct ExtensionBridge {
     tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<String>>>>,
     client_count: Arc<AtomicUsize>,
+    pub last_tab_url: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 const WS_PORT: u16 = 8765;
@@ -423,11 +603,13 @@ pub fn run() {
     let bridge = ExtensionBridge {
         tx: Arc::new(tokio::sync::Mutex::new(Some(cmd_tx))),
         client_count: Arc::clone(&client_count),
+        last_tab_url: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_stt::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(bridge)
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -447,7 +629,10 @@ pub fn run() {
             transcribe_audio,
             open_url,
             open_app,
-            send_to_extension
+            send_to_extension,
+            press_keys,
+            get_frontmost_app,
+            activate_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -460,7 +645,7 @@ async fn handle_parse_and_run(
     command: &str,
     clients: &Arc<tokio::sync::Mutex<Vec<WsWriter>>>,
 ) {
-    let intent = match parse_intent(command.to_string(), None).await {
+    let intent = match parse_intent(command.to_string(), None, app.clone()).await {
         Ok(i) => i,
         Err(e) => {
             let _ = app.emit("extension-result", format!("Parse error: {}", e));
@@ -477,7 +662,12 @@ async fn handle_parse_and_run(
         if !EXTENSION_EXECUTABLE.iter().any(|a| *a == action) {
             continue;
         }
-        let Some(cmd) = format_step_for_extension(step) else { continue };
+        let page_url = if let Some(bridge) = app.try_state::<ExtensionBridge>() {
+            bridge.last_tab_url.lock().await.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let Some(cmd) = format_step_for_extension(step, &page_url) else { continue };
         if step.action.to_lowercase() == "open" || step.action.to_lowercase() == "search" {
             just_opened_url = true;
         }
@@ -536,16 +726,31 @@ async fn run_ws_bridge(
                         while let Some(Ok(msg)) = read.next().await {
                             if let Message::Text(text) = msg {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                    if v.get("type").and_then(|t| t.as_str()) == Some("PARSE_AND_RUN")
-                                        && v.get("command").and_then(|c| c.as_str()).is_some()
-                                    {
-                                        let command = v["command"].as_str().unwrap_or("").to_string();
-                                        let app_clone = app.clone();
-                                        let clients_clone = Arc::clone(&clients_for_broadcast);
-                                        tauri::async_runtime::spawn(async move {
-                                            handle_parse_and_run(&app_clone, &command, &clients_clone).await;
-                                        });
-                                        continue;
+                                    if let Some(t) = v.get("type").and_then(|x| x.as_str()) {
+                                        if t == "TAB_CONTEXT" {
+                                            if let Some(url) = v.get("url").and_then(|x| x.as_str()) {
+                                                if let Some(bridge) = app.try_state::<ExtensionBridge>() {
+                                                    let _ = bridge.last_tab_url.lock().await.insert(url.to_string());
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                        if t == "PARSE_AND_RUN"
+                                            && v.get("command").and_then(|c| c.as_str()).is_some()
+                                        {
+                                            let command = v["command"].as_str().unwrap_or("").to_string();
+                                            if let Some(url) = v.get("url").and_then(|x| x.as_str()) {
+                                                if let Some(bridge) = app.try_state::<ExtensionBridge>() {
+                                                    let _ = bridge.last_tab_url.lock().await.insert(url.to_string());
+                                                }
+                                            }
+                                            let app_clone = app.clone();
+                                            let clients_clone = Arc::clone(&clients_for_broadcast);
+                                            tauri::async_runtime::spawn(async move {
+                                                handle_parse_and_run(&app_clone, &command, &clients_clone).await;
+                                            });
+                                            continue;
+                                        }
                                     }
                                     let m = v.get("message").and_then(|x| x.as_str()).unwrap_or("");
                                     let _ = app.emit("extension-result", m);
